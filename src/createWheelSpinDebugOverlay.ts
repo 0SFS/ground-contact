@@ -1,5 +1,5 @@
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
-import { Color3, Constants, MeshBuilder, TransformNode, Vector3, type Scene } from "@babylonjs/core";
+import { Color3, Constants, CreateLineSystem, TransformNode, Vector3, type Scene } from "@babylonjs/core";
 import { C172_GROUND_CONTACTS, groundContactBodyPosition } from "./collisionGeometry";
 import { WHEEL_SPIN_CONFIGS, type WheelSpinState } from "./wheelSpin";
 
@@ -36,7 +36,7 @@ export function createWheelSpinDebugOverlay(scene: Scene, parent: TransformNode,
         lines.push(ring, [new Vector3(x, 0, 0), ring[0]]);
       }
       lines.push([new Vector3(-config.widthMeters / 2, 0, 0), new Vector3(config.widthMeters / 2, 0, 0)]);
-      const mesh = MeshBuilder.CreateLineSystem(`wheel-spin-debug/${config.name}/tire`, { lines }, scene);
+      const mesh = CreateLineSystem(`wheel-spin-debug/${config.name}/tire`, { lines }, scene);
       mesh.parent = rotor;
       mesh.color = Color3.FromHexString("#ffbb46");
       mesh.alpha = 0.95;

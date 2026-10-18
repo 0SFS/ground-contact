@@ -1,6 +1,6 @@
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
 import {
-  Color3, Constants, Material, MeshBuilder, StandardMaterial, TransformNode, Vector3, VertexBuffer,
+  Color3, Constants, Material, CreateLineSystem, CreateSphere, StandardMaterial, TransformNode, Vector3, VertexBuffer,
   type LinesMesh, type Mesh, type Scene,
 } from "@babylonjs/core";
 import { BODY_COLLISION_PROBES, C172_GROUND_CONTACTS, groundContactBodyPosition } from "./collisionGeometry";
@@ -46,7 +46,7 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
     }
 
     function marker(kind: MarkerKind, name: string): Mesh {
-      const mesh = MeshBuilder.CreateSphere(`collision-debug/${kind}/${name}`,
+      const mesh = CreateSphere(`collision-debug/${kind}/${name}`,
         { diameter: kind === "cg" ? 0.18 : 0.24, segments: 4 }, scene);
       mesh.parent = root;
       mesh.material = palette[kind];
@@ -72,7 +72,7 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       groundMarkers.push(mesh);
     }
     const markers = [...bodyMarkers, ...groundMarkers];
-    guides = MeshBuilder.CreateLineSystem("collision-debug/guides", {
+    guides = CreateLineSystem("collision-debug/guides", {
       lines: markers.map(mesh => [Vector3.Zero(), mesh.position]), updatable: true,
     }, scene);
     guides.parent = root;

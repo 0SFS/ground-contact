@@ -1,3 +1,4 @@
+import { ChoiceTrack, HelpTip } from "foss-earth/shell";
 import {
   GROUND_CHOICE_LABELS, GROUND_CHOICES, GROUND_FIELD_LABELS, groundChoiceUnavailable,
   type GroundCapabilities, type GroundInteractionSettingsV1, type GroundLockableKey, type GroundResolution,
@@ -23,6 +24,18 @@ export type GroundInteractionAction =
 
 const ROW_LABELS = GROUND_FIELD_LABELS;
 
+/** Compact segment text for rows drawn as a track; the full name stays the accessible name. */
+const SHORT_LABELS: { [K in GroundLockableKey]?: Partial<Record<GroundInteractionSettingsV1[K], string>> } = {
+  rotation: { instant: "Instant", inertia: "Inertia" },
+  forceModel: { "jsbsim": "JSBSim", "coupled-rigid": "Rigid", "combined-slip": "Slip", "compliant-soil": "Soil" },
+  contactModel: { "shared": "Shared", "per-wheel-point": "Per wheel", "footprint": "Footprint", "swept": "Swept" },
+  haptics: { landing: "Landing" },
+  wheelVisuals: { asset: "Asset" },
+};
+
+/** Rows with up to four choices are a track; longer lists stay a dropdown as wide as its text. */
+const TRACK_LIMIT = 4;
+
 /** Structural unavailability only; dependencies such as audio → inertia stay selectable. */
 function unimplemented<K extends GroundLockableKey>(key: K, value: GroundInteractionSettingsV1[K], capabilities: GroundCapabilities) {
   return groundChoiceUnavailable(key, value, { rotation: "inertia" }, capabilities);
@@ -33,24 +46,34 @@ function ChoiceRow<K extends GroundLockableKey>({ field, state, onAction }: {
 }) {
   const entry = state.resolution.entries[field];
   const labels = GROUND_CHOICE_LABELS[field] as Record<string, string>;
+  const short = (SHORT_LABELS[field] ?? {}) as Record<string, string | undefined>;
+  const values = GROUND_CHOICES[field] as readonly string[];
+  const choices = values.map(value => ({ id: value, label: labels[value], shortLabel: short[value], unavailable: unimplemented(field, value as never, state.capabilities) }));
+  const set = (value: string) => onAction({ type: "set", patch: { [field]: value } });
+  // Why a choice cannot run, behind ? rather than inside the option text.
+  const unavailable = choices.filter(choice => choice.unavailable);
+  const help = unavailable.length ? <ul>{unavailable.map(choice => <li key={choice.id}>{choice.label}: {choice.unavailable}</li>)}</ul> : undefined;
+  // "Wheel response [Off / Instant / Inertia] ?  Lock [switch]"
   return <div className="flight-panel__ground-row">
-    <label className="flight-panel__field">
-      <span>{ROW_LABELS[field]}</span>
-      <select aria-label={ROW_LABELS[field]} value={state.settings[field]}
-        onChange={event => onAction({ type: "set", patch: { [field]: event.target.value } })}>
-        {(GROUND_CHOICES[field] as readonly string[]).map(value => {
-          const reason = unimplemented(field, value as never, state.capabilities);
-          return <option key={value} value={value} disabled={reason !== null}>
-            {labels[value]}{reason ? ` — ${reason}` : ""}
-          </option>;
-        })}
-      </select>
-    </label>
-    <label className="flight-panel__field flight-panel__field--inline flight-panel__ground-lock"
-      title="Auto cannot change a locked choice">
-      <input type="checkbox" aria-label={`Lock ${ROW_LABELS[field]}`} checked={state.settings.locked[field] === true}
-        onChange={event => onAction({ type: "lock", key: field, locked: event.target.checked })} />
+    {values.length <= TRACK_LIMIT
+      ? <ChoiceTrack heading={ROW_LABELS[field]} value={state.settings[field]} onChange={set} choices={choices} help={help}
+        helpLabel={`Explain ${ROW_LABELS[field]} choices`} />
+      : <>
+        <label className="flight-panel__field">
+          <span>{ROW_LABELS[field]}</span>
+          <select aria-label={ROW_LABELS[field]} value={state.settings[field]} onChange={event => set(event.target.value)}>
+            {choices.map(choice => <option key={choice.id} value={choice.id} disabled={choice.unavailable !== null}>{choice.label}</option>)}
+          </select>
+        </label>
+        {help && <HelpTip label={`Explain ${ROW_LABELS[field]} choices`}>{help}</HelpTip>}
+      </>}
+    <label className="flight-panel__switch flight-panel__ground-lock" title="Auto cannot change a locked choice">
       <span>Lock</span>
+      <span className="foss-earth-choice foss-earth-switch">
+        <input type="checkbox" aria-label={`Lock ${ROW_LABELS[field]}`} checked={state.settings.locked[field] === true}
+          onChange={event => onAction({ type: "lock", key: field, locked: event.target.checked })} />
+        <span className="foss-earth-switch__knob" aria-hidden="true" />
+      </span>
     </label>
     {(entry.reason || entry.requested !== entry.active) && <p className={`flight-panel__hint${entry.pending ? "" : " is-error"}`}
       role="status" aria-label={`${ROW_LABELS[field]} status`}>
@@ -66,20 +89,23 @@ export function GroundInteractionSettingsPanel({ state, onAction }: {
   return (
     <fieldset className="flight-panel__fieldset" aria-label="Ground interaction">
       <legend>Ground interaction</legend>
-      <p className="flight-panel__hint">
-        Named sets of these choices, such as Ground: Minimal and Ground: Landing feedback, are presets, in Settings → Presets.
-      </p>
-      <div className="flight-panel__segmented" role="group" aria-label="Ground interaction selection">
-        {(["auto", "manual"] as const).map(selection => <button key={selection} type="button"
-          className={settings.selection === selection ? "is-active" : ""} aria-pressed={settings.selection === selection}
-          onClick={() => onAction({ type: "set", patch: { selection } })}>
-          {selection === "auto" ? "Auto within my choices" : "Manual"}
-        </button>)}
-      </div>
-      <p className="flight-panel__hint">
-        Auto only substitutes a cheaper implemented choice when a request cannot run; it never changes forces,
-        contact or the wheel model during a landing. Wheel response and force/contact changes apply when paused or reset.
-      </p>
+      {/* "Selection [Auto / Manual] ?" */}
+      <ChoiceTrack heading="Selection" value={settings.selection}
+        onChange={selection => onAction({ type: "set", patch: { selection: selection as GroundInteractionSettingsV1["selection"] } })}
+        choices={[{ id: "auto", label: "Auto within my choices", shortLabel: "Auto" }, { id: "manual", label: "Manual" }]}
+        helpLabel="Explain ground interaction selection"
+        help={<>
+          <p>
+            Auto only substitutes a cheaper implemented choice when a request cannot run; it never changes forces,
+            contact or the wheel model during a landing. A locked choice is never substituted. Wheel response and
+            force/contact changes apply when paused or reset.
+          </p>
+          <p>Named sets of these choices, such as Ground: Minimal and Ground: Landing feedback, are presets, in Settings → Presets.</p>
+          <p>
+            Performance: not profiled on this device, so no live cost is shown. Recorded terminal benchmarks
+            cover one Apple M5 machine and are not a hardware policy.
+          </p>
+        </>} />
       <ChoiceRow field="rotation" state={state} onAction={onAction} />
       <ChoiceRow field="forceModel" state={state} onAction={onAction} />
       <ChoiceRow field="contactModel" state={state} onAction={onAction} />
@@ -100,17 +126,16 @@ export function GroundInteractionSettingsPanel({ state, onAction }: {
       </p>
       <ChoiceRow field="wheelVisuals" state={state} onAction={onAction} />
       <ChoiceRow field="backend" state={state} onAction={onAction} />
-      <p className="flight-panel__hint">
-        Performance: not profiled on this device, so no live cost is shown. Recorded terminal benchmarks
-        cover one Apple M5 machine and are not a hardware policy.
-      </p>
-      {state.experimentOverride && <div role="status" aria-label="Wheel experiment override">
-        <p className="flight-panel__hint">Debug experiment active for this session: {state.experimentOverride}.</p>
-        <button className="flight-panel__command" type="button" onClick={() => onAction({ type: "keep-experiment" })}>
-          Keep experiment choices
+      {/* "Debug experiment, this session: Instant rolling. [Keep] [Discard]" */}
+      {state.experimentOverride && <div className="flight-panel__row" role="status" aria-label="Wheel experiment override">
+        <p className="flight-panel__hint">Debug experiment, this session: {state.experimentOverride}.</p>
+        <button className="flight-panel__command" type="button" aria-label="Keep experiment choices"
+          onClick={() => onAction({ type: "keep-experiment" })}>
+          Keep
         </button>
-        <button className="flight-panel__command" type="button" onClick={() => onAction({ type: "discard-experiment" })}>
-          Return to saved settings
+        <button className="flight-panel__command" type="button" aria-label="Discard: return to saved settings"
+          onClick={() => onAction({ type: "discard-experiment" })}>
+          Discard
         </button>
       </div>}
       {state.message && <p className={`flight-panel__hint${state.message.error ? " is-error" : ""}`} role="status">{state.message.text}</p>}

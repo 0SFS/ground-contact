@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
-import { captureSimulation, restoreSimulation } from "../src/safeFlightState";
+import { captureSimulation, releaseSimulationCapture, restoreSimulation } from "../src/safeFlightState";
 
 const thermal = (index?: number) => `propulsion/engine${index === undefined ? "" : `[${index}]`}/thermal/`;
 const statePath = (index?: number) => `${thermal(index)}metal-temperature-state-k`;
@@ -122,5 +122,82 @@ describe("native engine thermal state in simulation snapshots", () => {
     restoreSimulation(t.native, snapshot);
     expect(t.sdk.setPropertyValue.mock.calls.filter(([path]) => path.includes("/thermal/"))).toEqual([]);
     expect(t.sdk.getPropertyValue.mock.calls.filter(([path]) => path.includes("/thermal/"))).toEqual([]);
+  });
+});
+
+describe("batched simulation capture", () => {
+  function withBatch(t: ReturnType<typeof fixture>, missing: string[] = []) {
+    const batches: { read: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[] = [];
+    const createPropertyBatch = vi.fn((paths: readonly string[]) => {
+      const batch = {
+        missing, dispose: vi.fn(),
+        read: vi.fn((target: Float64Array) => {
+          target.set(paths.map(path => missing.includes(path) ? Number.NaN : t.values[path] ?? 0));
+          return target;
+        }),
+      };
+      batches.push(batch);
+      return batch;
+    });
+    Object.assign(t.sdk, { createPropertyBatch });
+    return { batches, createPropertyBatch };
+  }
+
+  it("matches scalar snapshots including native plant state and pending thermal state", () => {
+    const prefix = "propulsion/engine[2]/plant/state/";
+    const catalog = [`${statePath()} (RW)`, `${initializedPath()} (R)`,
+      `${statePath(3)} (RW)`, `${initializedPath(3)} (R)`,
+      "fcs/stovl-pos-norm (RW)", "stores/external-tank[4]/attached (RW)", "propulsion/tank[5]/contents-lbs (RW)",
+      `${prefix}spool-rpm (RW)`, `${prefix}fuel-mass (RW)`, `${prefix}commit (RW)`];
+    const scalar = fixture(catalog), batched = fixture(catalog);
+    Object.assign(scalar.values, { [initializedPath(3)]: 0, [prefix + "spool-rpm"]: 6500,
+      [prefix + "fuel-mass"]: 0.08, "fcs/stovl-pos-norm": 0.6,
+      "stores/external-tank[4]/attached": 1, "propulsion/tank[5]/contents-lbs": 500 });
+    Object.assign(batched.values, scalar.values);
+    const b = withBatch(batched);
+    const first = captureSimulation(batched.native);
+    expect(first).toEqual(captureSimulation(scalar.native));
+    expect(first.controls).not.toHaveProperty(prefix + "commit");
+    expect(first.controls).not.toHaveProperty(statePath(3));
+    expect(batched.sdk.getPropertyValue).not.toHaveBeenCalled();
+    expect(b.createPropertyBatch.mock.calls[0]).toEqual([expect.any(Array), { create: false }]);
+    batched.values[prefix + "spool-rpm"] = 7000;
+    batched.values[initializedPath(3)] = 1;
+    const next = captureSimulation(batched.native);
+    expect(first.controls[prefix + "spool-rpm"]).toBe(6500);
+    expect(next.controls[prefix + "spool-rpm"]).toBe(7000);
+    expect(next.controls[statePath(3)]).toBe(620);
+    expect(b.createPropertyBatch).toHaveBeenCalledOnce();
+    expect(b.batches[0].read).toHaveBeenCalledTimes(2);
+    releaseSimulationCapture(batched.native);
+    releaseSimulationCapture(batched.native);
+    expect(b.batches[0].dispose).toHaveBeenCalledOnce();
+    captureSimulation(batched.native);
+    expect(b.createPropertyBatch).toHaveBeenCalledTimes(2);
+    releaseSimulationCapture(batched.native);
+  });
+
+  it("uses scalar values for missing nodes and preserves live non-finite values for rejection", () => {
+    const t = fixture();
+    const missing = "fcs/mixture-cmd-norm";
+    withBatch(t, [missing]);
+    t.values[missing] = 0.25;
+    t.values["position/h-sl-ft"] = Number.NaN;
+    const snapshot = captureSimulation(t.native);
+    expect(snapshot.controls[missing]).toBe(0.25);
+    expect(t.sdk.getPropertyValue.mock.calls).toEqual([[missing]]);
+    expect(snapshot.initial["ic/h-sl-ft"]).toBeNaN();
+    expect(() => restoreSimulation(t.native, snapshot)).toThrow("Invalid simulation snapshot");
+    expect(t.sdk.resetToInitialConditions).not.toHaveBeenCalled();
+    releaseSimulationCapture(t.native);
+  });
+
+  it("does not return a partial snapshot when a batch read fails", () => {
+    const t = fixture();
+    const b = withBatch(t);
+    captureSimulation(t.native);
+    b.batches[0].read.mockImplementationOnce(() => { throw new Error("Native read failed"); });
+    expect(() => captureSimulation(t.native)).toThrow("Native read failed");
+    releaseSimulationCapture(t.native);
   });
 });

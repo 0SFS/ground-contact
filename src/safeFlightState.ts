@@ -1,6 +1,7 @@
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
 import type { FlightState } from "./flightState";
 import { fuelTankContentsPath, fuelTankIndices } from "@0sfs/fuel/fuelTanks";
+import { createPropertyReadBatch } from "./propertyReadBatch";
 
 /**
  * Which envelope checks a state fails, as readable strings.
@@ -72,28 +73,12 @@ function engineThermalStateProperties(sdk: JSBSimSdk): EngineStateProperties["th
   return engineStateProperties(sdk).thermal;
 }
 
-function captureEngineThermalState(sdk: JSBSimSdk): [string, number][] {
-  return engineThermalStateProperties(sdk).flatMap(({ state, initialized }) => {
-    // A pending native seed is not a hot state. Restoring a positive Kelvin
-    // value marks it initialized, so omit pending engines to retain that state.
-    const ready = sdk.getPropertyValue(initialized);
-    if (!Number.isFinite(ready) || ready <= 0.5) return [];
-    const temperature = sdk.getPropertyValue(state);
-    return Number.isFinite(temperature) && temperature > 0 ? [[state, temperature] as [string, number]] : [];
-  });
-}
-
 /** Restore observed native wall state before RunIC or warm engine initialization. */
 export function restoreEngineThermalState(sdk: JSBSimSdk, snapshotControls: Readonly<Record<string, number>>): void {
   for (const { state } of engineThermalStateProperties(sdk)) {
     const temperature = snapshotControls[state];
     if (Number.isFinite(temperature) && temperature > 0) sdk.setPropertyValue(state, temperature);
   }
-}
-
-function captureEnginePlantState(sdk: JSBSimSdk): [string, number][] {
-  return engineStateProperties(sdk).plant.flatMap(({ fields }) =>
-    fields.map(path => [path, sdk.getPropertyValue(path)] as [string, number]));
 }
 
 /**
@@ -146,24 +131,62 @@ const initialProperties: Record<string, string> = {
   "ic/p-rad_sec": "velocities/p-rad_sec", "ic/q-rad_sec": "velocities/q-rad_sec", "ic/r-rad_sec": "velocities/r-rad_sec",
 };
 export function captureSimulation(sdk: JSBSimSdk) {
+  let capture = modelCaptures.get(sdk);
+  if (!capture) { capture = createSimulationCapture(sdk); modelCaptures.set(sdk, capture); }
+  const values = capture.reader.read();
+  const initial: Record<string, number> = {};
+  const snapshotControls: Record<string, number> = {};
+  for (const [ic, index] of capture.initial) initial[ic] = values[index];
+  for (const [property, index] of capture.controls) snapshotControls[property] = values[index];
+  for (const { state, initialized, temperature } of capture.thermal) {
+    // A pending native seed is not a hot state. Restoring positive Kelvin
+    // marks it initialized, so keep pending/non-finite state out of the record.
+    const ready = values[initialized], kelvin = values[temperature];
+    if (Number.isFinite(ready) && ready > 0.5 && Number.isFinite(kelvin) && kelvin > 0) snapshotControls[state] = kelvin;
+  }
   const timing = sdk as JSBSimSdk & { getSimTime?: () => number };
-  return { initial: Object.fromEntries(Object.entries(initialProperties).map(([ic, property]) => [ic, sdk.getPropertyValue(property)])),
+  return { initial,
     // The existing snapshot record includes restorable native state alongside
     // pilot controls. These values are observed, never synthesized by the app.
-    controls: Object.fromEntries([
-      ...controlsForModel(sdk).map(property => [property, sdk.getPropertyValue(property)] as [string, number]),
-      ...captureEngineThermalState(sdk),
-      ...captureEnginePlantState(sdk),
-    ]),
-    running: sdk.getPropertyValue("propulsion/engine/set-running") > 0.5,
+    controls: snapshotControls,
+    running: values[capture.running] > 0.5,
     // Contact recovery rebuilds model state at zero integration time, but it is
     // still part of the current flight. Preserve the public simulation clock so
     // real-time consumers do not mistake every terrain refinement for a seek.
     // Some unit-test doubles implement the property reader without the SDK's
     // convenience method. The installed runtime supplies getSimTime().
-    simTimeS: timing.getSimTime?.() ?? sdk.getPropertyValue("simulation/sim-time-sec") };
+    simTimeS: timing.getSimTime?.() ?? values[capture.time] };
 }
 export type SimulationSnapshot = ReturnType<typeof captureSimulation>;
+
+function createSimulationCapture(sdk: JSBSimSdk) {
+  const paths: string[] = [];
+  const slot = (path: string) => { paths.push(path); return paths.length - 1; };
+  const initial = Object.entries(initialProperties).map(([ic, path]) => [ic, slot(path)] as const);
+  const engine = engineStateProperties(sdk);
+  const controls = [...controlsForModel(sdk), ...engine.plant.flatMap(({ fields }) => fields)]
+    .map(path => [path, slot(path)] as const);
+  const thermal = engine.thermal.map(({ state, initialized }) => ({ state, initialized: slot(initialized), temperature: slot(state) }));
+  const running = slot("propulsion/engine/set-running"), time = slot("simulation/sim-time-sec");
+  const thermalFlags = new Map(thermal.map(({ temperature, initialized }) => [temperature, initialized]));
+  const reader = createPropertyReadBatch(sdk, paths, (index, values) => {
+    // Preserve lazy thermal reads for scalar backends: pending seeds need not
+    // provide a usable temperature getter yet. Flags precede their states.
+    const flag = thermalFlags.get(index);
+    return flag === undefined || Number.isFinite(values[flag]) && values[flag] > 0.5;
+  });
+  return { initial, controls, thermal, running, time, reader };
+}
+const modelCaptures = new WeakMap<JSBSimSdk, ReturnType<typeof createSimulationCapture>>();
+
+/** Free native views before their SDK and discard cached model capabilities. */
+export function releaseSimulationCapture(sdk: JSBSimSdk): void {
+  const capture = modelCaptures.get(sdk);
+  modelCaptures.delete(sdk);
+  modelControls.delete(sdk);
+  modelEngineState.delete(sdk);
+  capture?.reader.dispose();
+}
 
 /** Clear contact forces and integrator history before rebuilding valid kinematics. */
 export function restoreSimulation(sdk: JSBSimSdk, snapshot: SimulationSnapshot): void {

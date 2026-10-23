@@ -29,10 +29,32 @@ export function validFlightState(state: FlightState): boolean {
 
 const controls = ["fcs/throttle-cmd-norm", "fcs/mixture-cmd-norm", "fcs/elevator-cmd-norm",
   "fcs/aileron-cmd-norm", "fcs/rudder-cmd-norm", "fcs/pitch-trim-cmd-norm", "fcs/roll-trim-cmd-norm", "gear/gear-cmd-norm", "gear/gear-pos-norm",
-  "fcs/flap-cmd-norm", "fcs/left-brake-cmd-norm", "fcs/right-brake-cmd-norm",
+  "fcs/flap-cmd-norm", "fcs/brake-cmd-norm", "fcs/left-brake-cmd-norm", "fcs/right-brake-cmd-norm",
   "atmosphere/wind-north-fps", "atmosphere/wind-east-fps", "atmosphere/wind-down-fps"];
 const optionalAircraftControls = ["fcs/stovl-cmd-norm", "fcs/stovl-pos-norm", "fcs/control-law-mode"];
 const modelControls = new WeakMap<JSBSimSdk, readonly string[]>();
+const weaponStationsPresent = new WeakMap<JSBSimSdk, boolean>();
+
+function catalogTokens(sdk: JSBSimSdk, prefix: string): string[] {
+  return (sdk.queryPropertyCatalog?.(prefix) ?? "").split(/\r?\n/)
+    .map(line => line.trim().split(/\s+/)[0] ?? "")
+    .filter((path): path is string => path.length > 0);
+}
+
+function hasWeaponStations(sdk: JSBSimSdk): boolean {
+  const known = weaponStationsPresent.get(sdk);
+  if (known !== undefined) return known;
+  const present = catalogTokens(sdk, "stores/").includes("stores/station[1]/occupied");
+  weaponStationsPresent.set(sdk, present);
+  return present;
+}
+
+/** Station inputs, doors, rounds, and the master arm. Not derived drag, and not the fuel tanks. */
+function isWeaponSnapshotProperty(property: string): boolean {
+  return /^stores\/station\[\d+\]\/(?:occupied|store-id|mass-lbs|drag-area-ft2)$/.test(property)
+    || /^stores\/bay\[\d+\]\/door-(?:cmd|pos)-norm$/.test(property)
+    || property === "stores/gun/rounds" || property === "stores/master-arm";
+}
 interface EngineStateProperties {
   thermal: readonly { state: string; initialized: string }[];
   /** Each coupled-plant engine's staged state record: its read-write fields and its commit. */
@@ -96,10 +118,19 @@ export function restoreEnginePlantState(sdk: JSBSimSdk, snapshotControls: Readon
 }
 
 function restoreControls(sdk: JSBSimSdk, snapshotControls: Readonly<Record<string, number>>): void {
+  // Older snapshots stored only the equal wheel commands. The F-35B now
+  // derives its individual brakes from this pilot command in the native FCS.
+  if (!("fcs/brake-cmd-norm" in snapshotControls)) {
+    const left = snapshotControls["fcs/left-brake-cmd-norm"], right = snapshotControls["fcs/right-brake-cmd-norm"];
+    if (Number.isFinite(left) && Number.isFinite(right)) sdk.setPropertyValue("fcs/brake-cmd-norm", Math.max(left, right));
+  }
   for (const [property, value] of Object.entries(snapshotControls)) {
     // Native thermal and plant state have their own capability and validation
     // boundary; an old/foreign snapshot must not invent nodes on another engine model.
     if (/^propulsion\/engine(?:\[\d+\])?\/(?:thermal|plant)\//.test(property)) continue;
+    // Derived drag is recomputed. A model without weapon stations must not gain them.
+    if (/^stores\/station\[\d+\]\/drag-lbs$/.test(property)) continue;
+    if (isWeaponSnapshotProperty(property) && !hasWeaponStations(sdk)) continue;
     sdk.setPropertyValue(property, value);
   }
 }
@@ -113,10 +144,13 @@ function controlsForModel(sdk: JSBSimSdk): readonly string[] {
     ? sdk.queryPropertyCatalog("fcs/").split(/\r?\n/).map(line => line.trim().split(/\s+/)[0])
     : []);
   // Every tank, however many the aircraft has: the Fuel tab can fill any of them.
+  // Keep this selection with @0sfs/stores persisted store properties. Derived drag stays out.
+  const storePaths = catalogTokens(sdk, "stores/");
+  const weapons = storePaths.includes("stores/station[1]/occupied");
+  weaponStationsPresent.set(sdk, weapons);
   const paths = [...controls, ...optionalAircraftControls.filter(path => catalog.has(path)),
-    ...(sdk.queryPropertyCatalog?.("stores/external-tank") ?? "").split(/\r?\n/)
-      .map(line => line.trim().split(/\s+/)[0]!)
-      .filter(path => /^stores\/external-tank(?:\[\d+\])?\/attached$/.test(path)),
+    ...storePaths.filter(path => /^stores\/external-tank(?:\[\d+\])?\/attached$/.test(path)
+      || (weapons && isWeaponSnapshotProperty(path))),
     ...fuelTankIndices(sdk).map(fuelTankContentsPath)];
   modelControls.set(sdk, paths);
   return paths;
@@ -184,6 +218,7 @@ export function releaseSimulationCapture(sdk: JSBSimSdk): void {
   const capture = modelCaptures.get(sdk);
   modelCaptures.delete(sdk);
   modelControls.delete(sdk);
+  weaponStationsPresent.delete(sdk);
   modelEngineState.delete(sdk);
   capture?.reader.dispose();
 }

@@ -46,6 +46,27 @@ function fixture(catalog: readonly string[] = [
   return { sdk, native: sdk as unknown as JSBSimSdk, values, startupStates };
 }
 
+describe("brake commands in simulation snapshots", () => {
+  it("preserves the pilot brake independently of differential wheel commands", () => {
+    const t = fixture();
+    Object.assign(t.values, { "fcs/brake-cmd-norm": 0.4, "fcs/left-brake-cmd-norm": 0.2, "fcs/right-brake-cmd-norm": 0.7 });
+    const snapshot = captureSimulation(t.native);
+    expect(snapshot.controls["fcs/brake-cmd-norm"]).toBe(0.4);
+    t.values["fcs/brake-cmd-norm"] = 0;
+    restoreSimulation(t.native, snapshot);
+    expect(t.values["fcs/brake-cmd-norm"]).toBe(0.4);
+  });
+
+  it("restores the equal brake command from snapshots made before differential braking", () => {
+    const t = fixture();
+    const snapshot = captureSimulation(t.native);
+    delete snapshot.controls["fcs/brake-cmd-norm"];
+    snapshot.controls["fcs/left-brake-cmd-norm"] = snapshot.controls["fcs/right-brake-cmd-norm"] = 0.6;
+    restoreSimulation(t.native, snapshot);
+    expect(t.values["fcs/brake-cmd-norm"]).toBe(0.6);
+  });
+});
+
 describe("native engine thermal state in simulation snapshots", () => {
   it.each(["core", "2nd-wall"])("captures and restores named solid %s using its own initialization flag", region => {
     const core = `${thermal()}${region}/metal-temperature-state-k`;
@@ -125,6 +146,52 @@ describe("native engine thermal state in simulation snapshots", () => {
   });
 });
 
+describe("hung stores in simulation snapshots", () => {
+  const storeCatalog = [
+    "stores/external-tank[0]/attached (RW)",
+    "stores/station[1]/occupied (RW)", "stores/station[1]/store-id (RW)",
+    "stores/station[1]/mass-lbs (RW)", "stores/station[1]/drag-area-ft2 (RW)",
+    "stores/station[1]/drag-lbs (R)",
+    "stores/bay[0]/door-cmd-norm (RW)", "stores/bay[0]/door-pos-norm (RW)",
+    "stores/gun/rounds (RW)", "stores/master-arm (RW)",
+  ];
+
+  it("keeps the hung load and leaves derived drag out", () => {
+    const t = fixture(storeCatalog);
+    Object.assign(t.values, {
+      "stores/station[1]/occupied": 1, "stores/station[1]/store-id": 3,
+      "stores/station[1]/mass-lbs": 1013, "stores/station[1]/drag-area-ft2": 1,
+      "stores/station[1]/drag-lbs": 40, "stores/bay[0]/door-cmd-norm": 1,
+      "stores/bay[0]/door-pos-norm": 0.4, "stores/gun/rounds": 220, "stores/master-arm": 0,
+    });
+    const snapshot = captureSimulation(t.native);
+    expect(snapshot.controls["stores/station[1]/mass-lbs"]).toBe(1013);
+    expect(snapshot.controls["stores/station[1]/store-id"]).toBe(3);
+    expect(snapshot.controls["stores/bay[0]/door-pos-norm"]).toBe(0.4);
+    expect(snapshot.controls["stores/gun/rounds"]).toBe(220);
+    expect(snapshot.controls["stores/master-arm"]).toBe(0);
+    expect(snapshot.controls["stores/external-tank[0]/attached"]).toBe(0);
+    expect(snapshot.controls).not.toHaveProperty("stores/station[1]/drag-lbs");
+    snapshot.controls["stores/station[1]/drag-lbs"] = 40;
+    t.values["stores/station[1]/mass-lbs"] = 0;
+    restoreSimulation(t.native, snapshot);
+    expect(t.values["stores/station[1]/mass-lbs"]).toBe(1013);
+    expect(t.sdk.setPropertyValue).not.toHaveBeenCalledWith("stores/station[1]/drag-lbs", 40);
+  });
+
+  it("does not invent weapon stations on a model that has none", () => {
+    const t = fixture([]);
+    const snapshot = captureSimulation(t.native);
+    snapshot.controls["stores/station[1]/occupied"] = 1;
+    snapshot.controls["stores/station[1]/mass-lbs"] = 1013;
+    snapshot.controls["stores/master-arm"] = 1;
+    restoreSimulation(t.native, snapshot);
+    expect(t.sdk.setPropertyValue).not.toHaveBeenCalledWith("stores/station[1]/occupied", 1);
+    expect(t.sdk.setPropertyValue).not.toHaveBeenCalledWith("stores/master-arm", 1);
+    expect(t.values["stores/station[1]/occupied"]).toBeUndefined();
+  });
+});
+
 describe("batched simulation capture", () => {
   function withBatch(t: ReturnType<typeof fixture>, missing: string[] = []) {
     const batches: { read: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[] = [];
@@ -157,6 +224,7 @@ describe("batched simulation capture", () => {
     const b = withBatch(batched);
     const first = captureSimulation(batched.native);
     expect(first).toEqual(captureSimulation(scalar.native));
+    expect(first.controls["stores/external-tank[4]/attached"]).toBe(1);
     expect(first.controls).not.toHaveProperty(prefix + "commit");
     expect(first.controls).not.toHaveProperty(statePath(3));
     expect(batched.sdk.getPropertyValue).not.toHaveBeenCalled();

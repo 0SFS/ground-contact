@@ -1,4 +1,4 @@
-import { ChoiceTrack, HelpTip } from "foss-earth/shell";
+import { ChoiceTrack, HelpTip, Resettable } from "foss-earth/shell";
 import {
   GROUND_CHOICE_LABELS, GROUND_CHOICES, GROUND_FIELD_LABELS, groundChoiceUnavailable,
   type GroundCapabilities, type GroundInteractionSettingsV1, type GroundLockableKey, type GroundResolution,
@@ -56,24 +56,28 @@ function ChoiceRow<K extends GroundLockableKey>({ field, state, onAction }: {
   // "Wheel response [Off / Instant / Inertia] ?  Lock [switch]"
   return <div className="flight-panel__ground-row">
     {values.length <= TRACK_LIMIT
-      ? <ChoiceTrack heading={ROW_LABELS[field]} value={state.settings[field]} onChange={set} choices={choices} help={help}
+      ? <ChoiceTrack heading={ROW_LABELS[field]} value={state.settings[field]} parameter={`osfs.ground.${field}`} onChange={set} choices={choices} help={help}
         helpLabel={`Explain ${ROW_LABELS[field]} choices`} />
       : <>
         <label className="flight-panel__field">
           <span>{ROW_LABELS[field]}</span>
-          <select aria-label={ROW_LABELS[field]} value={state.settings[field]} onChange={event => set(event.target.value)}>
-            {choices.map(choice => <option key={choice.id} value={choice.id} disabled={choice.unavailable !== null}>{choice.label}</option>)}
-          </select>
+          <Resettable parameter={`osfs.ground.${field}`} name={ROW_LABELS[field]}>
+            <select aria-label={ROW_LABELS[field]} value={state.settings[field]} onChange={event => set(event.target.value)}>
+              {choices.map(choice => <option key={choice.id} value={choice.id} disabled={choice.unavailable !== null}>{choice.label}</option>)}
+            </select>
+          </Resettable>
         </label>
         {help && <HelpTip label={`Explain ${ROW_LABELS[field]} choices`}>{help}</HelpTip>}
       </>}
     <label className="flight-panel__switch flight-panel__ground-lock" title="Auto cannot change a locked choice">
       <span>Lock</span>
-      <span className="foss-earth-choice foss-earth-switch">
-        <input type="checkbox" aria-label={`Lock ${ROW_LABELS[field]}`} checked={state.settings.locked[field] === true}
-          onChange={event => onAction({ type: "lock", key: field, locked: event.target.checked })} />
-        <span className="foss-earth-switch__knob" aria-hidden="true" />
-      </span>
+      <Resettable parameter={`osfs.ground.lock.${field}`} name={`Lock ${ROW_LABELS[field]}`}>
+        <span className="foss-earth-choice foss-earth-switch">
+          <input type="checkbox" aria-label={`Lock ${ROW_LABELS[field]}`} checked={state.settings.locked[field] === true}
+            onChange={event => onAction({ type: "lock", key: field, locked: event.target.checked })} />
+          <span className="foss-earth-switch__knob" aria-hidden="true" />
+        </span>
+      </Resettable>
     </label>
     {(entry.reason || entry.requested !== entry.active) && <p className={`flight-panel__hint${entry.pending ? "" : " is-error"}`}
       role="status" aria-label={`${ROW_LABELS[field]} status`}>
@@ -90,7 +94,7 @@ export function GroundInteractionSettingsPanel({ state, onAction }: {
     <fieldset className="flight-panel__fieldset" aria-label="Ground interaction">
       <legend>Ground interaction</legend>
       {/* "Selection [Auto / Manual] ?" */}
-      <ChoiceTrack heading="Selection" value={settings.selection}
+      <ChoiceTrack heading="Selection" value={settings.selection} parameter="osfs.ground.selection"
         onChange={selection => onAction({ type: "set", patch: { selection: selection as GroundInteractionSettingsV1["selection"] } })}
         choices={[{ id: "auto", label: "Auto within my choices", shortLabel: "Auto" }, { id: "manual", label: "Manual" }]}
         helpLabel="Explain ground interaction selection"
@@ -112,14 +116,18 @@ export function GroundInteractionSettingsPanel({ state, onAction }: {
       <ChoiceRow field="tireAudio" state={state} onAction={onAction} />
       <label className="flight-panel__field">
         <span>Tire audio volume<output>{Math.round(settings.tireAudioVolume * 100)}%</output></span>
-        <input type="range" aria-label="Tire audio volume" min={0} max={1} step={0.05} value={settings.tireAudioVolume}
-          onChange={event => onAction({ type: "set", patch: { tireAudioVolume: Number(event.target.value) } })} />
+        <Resettable parameter="osfs.ground.tireAudioVolume" name="Tire audio volume">
+          <input type="range" aria-label="Tire audio volume" min={0} max={1} step={0.05} value={settings.tireAudioVolume}
+            onChange={event => onAction({ type: "set", patch: { tireAudioVolume: Number(event.target.value) } })} />
+        </Resettable>
       </label>
       <ChoiceRow field="haptics" state={state} onAction={onAction} />
       <label className="flight-panel__field">
         <span>Haptic strength<output>{Math.round(settings.hapticStrength * 100)}%</output></span>
-        <input type="range" aria-label="Haptic strength" min={0} max={1} step={0.05} value={settings.hapticStrength}
-          onChange={event => onAction({ type: "set", patch: { hapticStrength: Number(event.target.value) } })} />
+        <Resettable parameter="osfs.ground.hapticStrength" name="Haptic strength">
+          <input type="range" aria-label="Haptic strength" min={0} max={1} step={0.05} value={settings.hapticStrength}
+            onChange={event => onAction({ type: "set", patch: { hapticStrength: Number(event.target.value) } })} />
+        </Resettable>
       </label>
       <p className="flight-panel__hint" aria-label="Haptic devices">
         Gamepad: {state.hapticDevices.gamepad} · Phone: {state.hapticDevices.phone}

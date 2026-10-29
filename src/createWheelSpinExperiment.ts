@@ -1,5 +1,6 @@
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
-import { createWheelSpinState, stepWheelSpin, WHEEL_SPIN_CONFIGS } from "./wheelSpin";
+import type { GroundContactCoreSource, GroundContactKernelStatus } from "./groundContactCore";
+import { createWheelSpinState, createWheelSpinStepper, WHEEL_SPIN_CONFIGS } from "./wheelSpin";
 import type { WheelSpinInput, WheelSpinMode, WheelSpinState } from "./wheelSpin";
 
 const METERS_PER_FOOT = 0.3048;
@@ -19,6 +20,10 @@ export interface WheelSpinExperiment {
   reset(): void;
   /** Stable objects updated in place; consumers must not modify them. */
   getStates(): readonly WheelSpinState[];
+  /** The kernel the spin steps on: the WASM core's when one was supplied and took it. */
+  status(): GroundContactKernelStatus;
+  /** Releases the WASM kernel; the core stays the caller's. */
+  dispose(): void;
 }
 
 /**
@@ -28,10 +33,12 @@ export interface WheelSpinExperiment {
  * angular speed. Steering/tilted ground make this longitudinal velocity and
  * spring/damper load approximate.
  */
-export function createWheelSpinExperiment(sdk: Pick<JSBSimSdk, "getPropertyValue">): WheelSpinExperiment {
+export function createWheelSpinExperiment(sdk: Pick<JSBSimSdk, "getPropertyValue">,
+  options: { core?: GroundContactCoreSource } = {}): WheelSpinExperiment {
   const states = WHEEL_SPIN_CONFIGS.map(() => createWheelSpinState());
-  const input: WheelSpinInput = { onGround: false, rollMetersSec: 0, normalLoadNewtons: 0,
-    compressionMeters: 0, steeringRad: 0, brake: 0 };
+  const inputs: WheelSpinInput[] = WHEEL_SPIN_CONFIGS.map(() => ({ onGround: false, rollMetersSec: 0,
+    normalLoadNewtons: 0, compressionMeters: 0, steeringRad: 0, brake: 0 }));
+  const stepper = createWheelSpinStepper(states.length, options);
   const read = (name: string): number => {
     const value = sdk.getPropertyValue(name);
     return Number.isFinite(value) ? value : 0;
@@ -43,6 +50,7 @@ export function createWheelSpinExperiment(sdk: Pick<JSBSimSdk, "getPropertyValue
       const rightBrake = read("fcs/right-brake-cmd-norm");
       for (let index = 0; index < states.length; index++) {
         const properties = GEAR_PROPERTIES[index];
+        const input = inputs[index];
         input.onGround = read(properties.wow) > 0.5;
         input.brake = index === 1 ? leftBrake : index === 2 ? rightBrake : 0;
         input.steeringRad = 0;
@@ -58,12 +66,14 @@ export function createWheelSpinExperiment(sdk: Pick<JSBSimSdk, "getPropertyValue
           input.rollMetersSec = read(properties.wheelSpeed) * METERS_PER_FOOT;
           if (index === 0) input.steeringRad = read("fcs/steer-pos-deg[0]") * Math.PI / 180;
         }
-        stepWheelSpin(states[index], WHEEL_SPIN_CONFIGS[index], input, dt, mode);
       }
+      stepper.step(states, WHEEL_SPIN_CONFIGS, inputs, dt, mode);
     },
     reset() {
       for (const state of states) Object.assign(state, createWheelSpinState());
     },
     getStates: () => states,
+    status: stepper.status,
+    dispose: stepper.dispose,
   };
 }

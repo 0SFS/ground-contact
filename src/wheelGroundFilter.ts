@@ -29,9 +29,16 @@ export interface WheelGroundFilter {
    * @param rawMeters   height sampled from the displayed surface
    * @param movedMeters horizontal distance travelled since the last call
    * @param snap        adopt the raw height outright (placement, a refined
-   *                    world, or too high for the wheels to be involved)
+   *                    world whose change could not be measured, or too high
+   *                    for the wheels to be involved)
    */
   height(rawMeters: number, movedMeters: number, snap: boolean): number;
+  /**
+   * Moves the filtered height by a surface refinement measured at one spot.
+   * The wheel keeps its place on the refined surface and keeps bridging the
+   * noise it was bridging, where adopting the new raw height would jolt it.
+   */
+  shift(deltaMeters: number): void;
   reset(): void;
 }
 
@@ -47,6 +54,9 @@ export function createWheelGroundFilter(lengthMeters = GROUND_FILTER_LENGTH_METE
       }
       filtered += (rawMeters - filtered) * (1 - Math.exp(-Math.max(movedMeters, 0) / lengthMeters));
       return filtered;
+    },
+    shift(deltaMeters: number): void {
+      if (filtered !== null && Number.isFinite(deltaMeters)) filtered += deltaMeters;
     },
     reset(): void { filtered = null; },
   };

@@ -1,0 +1,6 @@
+[toolchain]
+# The installed stable alias must match toolchain.lock.json. A version alias
+# here would make rustup download a second toolchain without asking the user.
+channel = "stable"
+profile = "minimal"
+

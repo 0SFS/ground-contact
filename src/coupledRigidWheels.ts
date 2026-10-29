@@ -1,3 +1,4 @@
+import { createKernelSlot, type GroundContactCoreSource, type GroundContactKernelStatus } from "./groundContactCore";
 import { wheelContactProblem, type Vec3, type WheelContact, type WheelForceResult } from "./wheelContact";
 
 /**
@@ -295,4 +296,134 @@ export function solveCoupledRigidWheels(
     result.dissipatedJ = dissipated[row.wheel];
   }
   return report;
+}
+
+export interface CoupledWheelSolver {
+  /** `solveCoupledRigidWheels` with the same arguments, on the WASM kernel when one is ready. */
+  solve(
+    body: RigidBodyVelocityState,
+    wheelNames: readonly WheelContact["wheel"][],
+    wheels: CoupledWheelState[],
+    params: readonly CoupledWheelParams[],
+    contacts: readonly WheelContact[],
+    brakes: readonly number[],
+    dtSeconds: number,
+    results: WheelForceResult[],
+    options?: CoupledSolveOptions,
+  ): CoupledSolveReport;
+  status(): GroundContactKernelStatus;
+  dispose(): void;
+}
+
+const BODY = { velocity: 10, angularVelocity: 13 } as const;
+const WHEEL_STRIDE = 10;
+const CONTACT_STRIDE = 25;
+const REPORT_LENGTH = 5;
+const RESULT_STRIDE = 11;
+
+const writeVec = (rows: Float64Array, at: number, vector: Vec3) => {
+  rows[at] = vector.x; rows[at + 1] = vector.y; rows[at + 2] = vector.z;
+};
+const readVec = (rows: Float64Array, at: number, out: Vec3 | undefined): Vec3 => {
+  const vector = out ?? { x: 0, y: 0, z: 0 };
+  vector.x = rows[at]; vector.y = rows[at + 1]; vector.z = rows[at + 2];
+  return vector;
+};
+
+/**
+ * `solveCoupledRigidWheels` for `wheelCount` wheels and up to `maxContacts`
+ * contacts (default `wheelCount`), delegated to the core's
+ * `createWheelSolver` when one is supplied. Identical to the reference,
+ * value for value: wheels and contacts are matched by the first index of
+ * their name in `wheelNames`, which keeps the reference's `===`. Results are
+ * written into the caller's vectors rather than replacing them.
+ */
+export function createCoupledWheelSolver(wheelCount: number,
+  options: { core?: GroundContactCoreSource; maxContacts?: number } = {}): CoupledWheelSolver {
+  const slot = createKernelSlot(options.core, "wasm-wheel-solver",
+    core => core.createWheelSolver(wheelCount, options.maxContacts ?? wheelCount));
+  return {
+    solve(body, wheelNames, wheels, params, contacts, brakes, dtSeconds, results, solveOptions = {}) {
+      const kernel = slot.current;
+      const reference = () => solveCoupledRigidWheels(body, wheelNames, wheels, params, contacts, brakes, dtSeconds, results, solveOptions);
+      if (!kernel) return reference();
+      const count = kernel.wheelCount;
+      if (wheels.length !== count || params.length < count || wheelNames.length < count || contacts.length > kernel.maxContacts) {
+        slot.refuse(`${wheels.length} wheels and ${contacts.length} contacts for a ${count}-wheel, ${kernel.maxContacts}-contact kernel`);
+        return reference();
+      }
+      try {
+        const state = kernel.body;
+        state[0] = body.massKg;
+        for (let index = 0; index < 9; index++) state[1 + index] = body.inverseInertiaWorld[index];
+        writeVec(state, BODY.velocity, body.velocity);
+        writeVec(state, BODY.angularVelocity, body.angularVelocity);
+        const rows = kernel.wheels;
+        for (let index = 0, at = 0; index < count; index++, at += WHEEL_STRIDE) {
+          const wheel = wheels[index], config = params[index];
+          rows[at] = 1 + wheelNames.indexOf(wheelNames[index]);
+          rows[at + 1] = wheel.spinRadSec;
+          rows[at + 2] = wheel.contactEpoch;
+          rows[at + 3] = wheel.warmTangentNs;
+          rows[at + 4] = wheel.warmBrakeNms;
+          rows[at + 5] = config.inertiaKgM2;
+          rows[at + 6] = config.frictionCoefficient;
+          rows[at + 7] = config.maxBrakeTorqueNm;
+          rows[at + 8] = config.bearingDragTorqueNm;
+          rows[at + 9] = brakes[index];
+        }
+        const packed = kernel.contacts;
+        for (let index = 0, at = 0; index < contacts.length; index++, at += CONTACT_STRIDE) {
+          const contact = contacts[index];
+          packed[at] = 1 + wheelNames.indexOf(contact.wheel);
+          writeVec(packed, at + 1, contact.axleOffsetM);
+          writeVec(packed, at + 4, contact.normalWorld);
+          writeVec(packed, at + 7, contact.forwardWorld);
+          writeVec(packed, at + 10, contact.lateralWorld);
+          writeVec(packed, at + 13, contact.wheelCenterVelocityMps);
+          writeVec(packed, at + 16, contact.groundVelocityMps);
+          packed[at + 19] = contact.normalLoadN;
+          packed[at + 20] = contact.compressionM;
+          packed[at + 21] = contact.steeringRad;
+          packed[at + 22] = contact.radiusM;
+          packed[at + 23] = contact.groundRevision;
+          packed[at + 24] = contact.contactEpoch;
+        }
+        kernel.run(dtSeconds, contacts.length,
+          typeof solveOptions.iterations === "number" ? solveOptions.iterations : NaN, solveOptions.warmStart !== false);
+      } catch (error) {
+        slot.fail(error);
+        return reference();
+      }
+      const state = kernel.body;
+      readVec(state, BODY.velocity, body.velocity);
+      readVec(state, BODY.angularVelocity, body.angularVelocity);
+      const rows = kernel.wheels;
+      for (let index = 0, at = 0; index < count; index++, at += WHEEL_STRIDE) {
+        const wheel = wheels[index];
+        wheel.spinRadSec = rows[at + 1];
+        wheel.contactEpoch = rows[at + 2];
+        wheel.warmTangentNs = rows[at + 3];
+        wheel.warmBrakeNms = rows[at + 4];
+      }
+      const output = kernel.output;
+      for (let index = 0; index < results.length; index++) {
+        const result = results[index];
+        if (!result) continue;
+        if (index >= count) { Object.assign(result, createWheelForceResult()); continue; }
+        const at = REPORT_LENGTH + index * RESULT_STRIDE;
+        result.bodyImpulseNs = readVec(output, at, result.bodyImpulseNs);
+        result.bodyAngularImpulseNms = readVec(output, at + 3, result.bodyAngularImpulseNms);
+        result.wheelAngularImpulseNms = output[at + 6];
+        result.longitudinalSlipMps = output[at + 7];
+        result.lateralSlipMps = output[at + 8];
+        result.normalImpulseNs = output[at + 9];
+        result.dissipatedJ = output[at + 10];
+      }
+      return { iterations: output[0], kineticEnergyBeforeJ: output[1], kineticEnergyAfterJ: output[2],
+        coldRetry: output[3] === 1, rejectedContacts: output[4] };
+    },
+    status: slot.status,
+    dispose: slot.dispose,
+  };
 }

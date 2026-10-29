@@ -1,8 +1,12 @@
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
 import type { SurfaceQuery } from "foss-earth/runtime";
 import { flightLog } from "@0sfs/logging/flightLog";
+import { bodyOffsetLocal, bodyToLocalRotation, groundContactBodyPosition, metresPerDegree } from "./collisionGeometry";
+import { GEAR_DOWN_POSITION, groundContactUnits, type GroundContactUnit } from "./groundContactClearance";
+import { createKernelSlot, type GroundContactCore, type GroundContactCoreSource, type GroundContactKernelStatus, type WasmContactSupport } from "./groundContactCore";
+import { createPropertyReadBatch } from "./propertyReadBatch";
 import { aircraftClearanceMeters, type AircraftClearanceStance, captureSimulation, restoreSimulation } from "./safeFlightState";
-import { createWheelGroundFilter } from "./wheelGroundFilter";
+import { createWheelGroundFilter, type WheelGroundFilter } from "./wheelGroundFilter";
 
 /**
  * A surface sample this far above a flying aircraft is not believed at all.
@@ -62,15 +66,577 @@ const BLIND_STEPS = 60;
  * touchdown is never met with a lagging ground height. */
 const WHEELS_CLEAR_METERS = 5;
 
+/**
+ * The ground under each contact is sampled while the lowest contact is within
+ * this height of the ground under the centre of gravity. Higher up, no contact
+ * can reach the surface, and the centre alone is sampled.
+ */
+const FOOTPRINT_RANGE_METERS = 10;
+
+/**
+ * Ground more than this above where a structure would rest is not support.
+ * The wingtip or tail is under it, or in the wall of a building the aircraft
+ * flew into, which is for hull collision to answer. A slope never gets this far
+ * above a contact, because the aircraft rides up it. Wheels are the bottom of
+ * the aircraft: ground above a wheel is an impact, as it is under the centre.
+ */
+const FOOTPRINT_REACH_METERS = 1;
+
+/**
+ * A contact's sample is reused until the contact has moved this far, plus its
+ * margin over the contact deciding the support, up to the reach. Ground
+ * cannot rise that margin under a contact within that travel on any slope
+ * the aircraft could ride over.
+ */
+const FOOTPRINT_RESAMPLE_METERS = 0.05;
+
+/**
+ * Footprint samples per physics step on Google tiles. Without the optional
+ * ground index those are picked triangle by triangle, at up to about half a
+ * millisecond a sample on dense tiles; raster samples are read from decoded
+ * grids and are not limited. A contact the limit defers keeps its last
+ * sample, and the most overdue go first.
+ */
+const GOOGLE_FOOTPRINT_SAMPLES_PER_STEP = 2;
+
+/**
+ * Google's revision changes whenever any tile changes visibility, nearly
+ * every frame while the camera moves. When the surface under the centre did
+ * not change, a contact's sample is confirmed lazily, at most one contact per
+ * this many steps and the longest unconfirmed first, instead of picking under
+ * every contact each frame.
+ */
+const FOOTPRINT_REVALIDATE_STEPS = 30;
+
+// Why a contact wants a sample, most pressing first: it has none; the world
+// changed under it; it moved on from it; or it is due a lazy confirmation.
+const SAMPLE_FIRST = 4, SAMPLE_URGENT = 3, SAMPLE_MOVED = 2, SAMPLE_LAZY = 1;
+
+interface SupportInput {
+  lat: number; lon: number; altitude: number;
+  roll: number; pitch: number; heading: number;
+  /** Filtered ground under the centre: the fallback, and the range reference. */
+  cgGround: number;
+  revision: number;
+  revisionChanged: boolean;
+  /** The refinement measured under the centre; NaN when it could not be. */
+  cgDelta: number;
+  /** Confirm every contact sample the revision may have changed now, not lazily. */
+  urgent: boolean;
+  /** Adopt raw heights outright, as the centre does. */
+  snap: boolean;
+  /** Footprint samples allowed this step. */
+  samples: number;
+  /** The support plane from the previous step; NaN without one. */
+  previousElevation: number;
+}
+
+/**
+ * The ground under the aircraft's contact units, given to JSBSim as the one
+ * horizontal plane it accepts for all of them.
+ *
+ * Under the centre of gravity alone, a sloped runway put the nose wheel or
+ * the tail under the surface and a hillside put a wingtip into it. The plane
+ * chosen here is the lowest at which no contact is deeper in its own ground
+ * than JSBSim's lowest contact is in the plane, so that contact's spring
+ * holds every other contact to at most its own compression. A structure that
+ * decides the plane can sink that compression into its ground, about 5 cm on
+ * the C172.
+ *
+ * The ground under the centre, sampled every step, stays a floor under the
+ * plane: a contact whose sample is deferred or missing never leaves the plane
+ * lower than the centre alone did, and a wall the aircraft drives into still
+ * stops it the step it appears. On flat ground the plane is that ground.
+ *
+ * A horizontal plane cannot pitch the aircraft onto a slope: the uphill
+ * contact carries it and the others ride clear of their ground. That needs a
+ * ground per contact in the native gear model.
+ */
+function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
+  let units: readonly GroundContactUnit[] = [];
+  let reader: ReturnType<typeof createPropertyReadBatch> | null = null;
+  let values = new Float64Array(0);
+  // The model has no contact units or does not report them; the centre's
+  // ground stands in until the next reset.
+  let unavailable = false;
+  let count = 0;
+  // Farthest contact from the centre, so a high aircraft skips the read.
+  let reachMeters = Number.POSITIVE_INFINITY;
+  let live = false;
+  // The previous plane's parts: the centre's ground and the lowest depth;
+  // and the height of the centre that its reach was judged from.
+  let hadSupport = false;
+  let prevCgGround = 0, prevLowest = 0, prevLevel = 0;
+  let revalidateIn = 0;
+  let steps = 0;
+  let filters: WheelGroundFilter[] = [];
+  // Per contact: the current footprint and its depth below the centre.
+  let down = new Float64Array(0), footLat = new Float64Array(0), footLon = new Float64Array(0);
+  // The last sample, where it was taken, the revision it was taken in, and
+  // the step it was last taken or confirmed.
+  let heldLat = new Float64Array(0), heldLon = new Float64Array(0), heldRaw = new Float64Array(0);
+  let heldRevision = new Float64Array(0), checked = new Float64Array(0);
+  // Refinement measured under the centre and applied to a sample not yet
+  // measured again at its own spot.
+  let provisional = new Float64Array(0);
+  // Filtered ground, NaN without a sample; margin over the deciding contact.
+  let ground = new Float64Array(0), margin = new Float64Array(0), moved = new Float64Array(0);
+  let shift = new Float64Array(0);
+  // Why each contact wants a sample this step, and its order within that.
+  let wants = new Uint8Array(0), rank = new Float64Array(0);
+  let prevGround = new Float64Array(0), prevDown = new Float64Array(0);
+  // Per contact at the previous step: it decided the plane; it had a sample.
+  let active = new Uint8Array(0), supported = new Uint8Array(0), prevSupported = new Uint8Array(0), prevSampled = new Uint8Array(0);
+  let urgent = new Uint8Array(0), wheel = new Uint8Array(0);
+  const rotation = new Float64Array(9);
+  const scale = { lat: 0, lon: 0 };
+  const cg = { xIn: 0, yIn: 0, zIn: 0 }, point = { xIn: 0, yIn: 0, zIn: 0 };
+  const body = { left: 0, up: 0, forward: 0 }, local = { north: 0, east: 0, down: 0 };
+  const result = { elevation: Number.NaN, refinement: 0 };
+
+  function clearContacts(): void {
+    if (!live) return;
+    live = false;
+    hadSupport = false;
+    for (let i = 0; i < count; i++) {
+      filters[i].reset();
+      heldRaw[i] = Number.NaN; ground[i] = Number.NaN;
+      provisional[i] = 0; margin[i] = 0; urgent[i] = 0; supported[i] = 0; prevSupported[i] = 0; prevSampled[i] = 0;
+    }
+  }
+
+  function forget(): void {
+    clearContacts();
+    reader?.dispose();
+    reader = null;
+    count = 0;
+    reachMeters = Number.POSITIVE_INFINITY;
+  }
+
+  function discover(): boolean {
+    if (reader) return true;
+    if (unavailable) return false;
+    try { units = groundContactUnits(sdk); }
+    catch { unavailable = true; return false; }
+    if (units.length === 0) { unavailable = true; return false; }
+    const paths = ["gear/num-units", "gear/gear-pos-norm", "inertia/cg-x-in", "inertia/cg-y-in", "inertia/cg-z-in"];
+    for (const unit of units) paths.push(`${unit.prefix}x-position`, `${unit.prefix}y-position`, `${unit.prefix}z-position`);
+    reader = createPropertyReadBatch(sdk, paths);
+    values = new Float64Array(paths.length);
+    count = units.length;
+    filters = Array.from({ length: count }, () => createWheelGroundFilter());
+    const floats = () => new Float64Array(count), flags = () => new Uint8Array(count);
+    down = floats(); footLat = floats(); footLon = floats();
+    heldLat = floats(); heldLon = floats(); heldRaw = floats().fill(Number.NaN);
+    heldRevision = floats(); checked = floats();
+    provisional = floats(); ground = floats().fill(Number.NaN); margin = floats(); moved = floats();
+    shift = floats(); rank = floats(); prevGround = floats(); prevDown = floats();
+    active = flags(); supported = flags(); prevSupported = flags(); prevSampled = flags(); urgent = flags(); wants = flags();
+    // BOGEY units are under gear/unit, STRUCTURE units under contact/unit.
+    wheel = Uint8Array.from(units, unit => unit.prefix.startsWith("gear/") ? 1 : 0);
+    return true;
+  }
+
+  /** Footprints of the contacts; returns the lowest active contact's depth below the centre. */
+  function readGeometry(input: SupportInput): number {
+    if (!discover()) return Number.NaN;
+    try { reader!.readInto(values); }
+    catch {
+      // A model load disposes the native batch; find the contacts again.
+      forget();
+      return Number.NaN;
+    }
+    if (values[0] !== count) { forget(); return Number.NaN; }
+    const gearDown = values[1] > GEAR_DOWN_POSITION;
+    cg.xIn = values[2]; cg.yIn = values[3]; cg.zIn = values[4];
+    bodyToLocalRotation(input.roll, input.pitch, input.heading, rotation);
+    metresPerDegree(input.lat, scale);
+    let lowest = Number.NEGATIVE_INFINITY, reach = 0;
+    for (let i = 0; i < count; i++) {
+      point.xIn = values[5 + i * 3]; point.yIn = values[6 + i * 3]; point.zIn = values[7 + i * 3];
+      groundContactBodyPosition(point, cg, body);
+      bodyOffsetLocal(body, rotation, local);
+      reach = Math.max(reach, Math.hypot(body.left, body.up, body.forward));
+      down[i] = local.down;
+      footLat[i] = input.lat + local.north / scale.lat;
+      footLon[i] = ((input.lon + local.east / scale.lon + 540) % 360) - 180;
+      // Native BOGEY support exists only above the gear-down position for
+      // retractable units; fixed units and structures always participate.
+      const on = !(units[i].retractable && !gearDown) && Number.isFinite(local.down)
+        && Number.isFinite(footLat[i]) && Number.isFinite(footLon[i]);
+      if (!on && active[i]) {
+        filters[i].reset();
+        heldRaw[i] = Number.NaN; ground[i] = Number.NaN; provisional[i] = 0; urgent[i] = 0;
+      }
+      active[i] = on ? 1 : 0;
+      if (on) lowest = Math.max(lowest, local.down);
+    }
+    reachMeters = Number.isFinite(reach) ? reach : Number.POSITIVE_INFINITY;
+    return lowest;
+  }
+
+  /** Travel after which a contact is sampled again: farther the less it matters. */
+  function spacing(i: number): number {
+    return FOOTPRINT_RESAMPLE_METERS + Math.min(Math.max(margin[i], 0), FOOTPRINT_REACH_METERS);
+  }
+
+  /** Forget the contacts and find them again, as after a model load. */
+  function reset(): void {
+    forget();
+    unavailable = false;
+    revalidateIn = 0;
+  }
+
+  function sampleFootprints(input: SupportInput): void {
+    const lazy = revalidateIn <= 0;
+    revalidateIn -= 1;
+    steps += 1;
+    for (let i = 0; i < count; i++) {
+      wants[i] = 0;
+      if (!active[i]) continue;
+      if (Number.isNaN(heldRaw[i])) { wants[i] = SAMPLE_FIRST; rank[i] = 0; continue; }
+      moved[i] = Math.hypot((footLat[i] - heldLat[i]) * scale.lat,
+        (((footLon[i] - heldLon[i] + 540) % 360) - 180) * scale.lon);
+      const stale = heldRevision[i] !== input.revision;
+      if (stale && urgent[i]) {
+        // The contact nearest to deciding the support first.
+        wants[i] = SAMPLE_URGENT; rank[i] = -margin[i];
+      } else if (moved[i] >= spacing(i)) {
+        // The most overdue first.
+        wants[i] = SAMPLE_MOVED; rank[i] = moved[i] / spacing(i);
+      } else if (stale && lazy) {
+        // The longest unconfirmed first: a revision that changes every frame
+        // leaves every contact stale, and the nearest would always win.
+        wants[i] = SAMPLE_LAZY; rank[i] = steps - checked[i];
+      }
+    }
+    for (let allowance = input.samples; allowance > 0; allowance--) {
+      let next = -1;
+      for (let i = 0; i < count; i++) {
+        if (wants[i] && (next < 0 || wants[i] > wants[next] || (wants[i] === wants[next] && rank[i] > rank[next]))) next = i;
+      }
+      if (next < 0) break;
+      const kind = wants[next];
+      wants[next] = 0;
+      if (kind === SAMPLE_URGENT || kind === SAMPLE_LAZY) {
+        if (kind === SAMPLE_LAZY) {
+          revalidateIn = FOOTPRINT_REVALIDATE_STEPS;
+          for (let i = 0; i < count; i++) if (wants[i] === SAMPLE_LAZY) wants[i] = 0;
+        }
+        // Measure the refinement where the sample was taken: two versions
+        // at one spot, never two heights along a path.
+        const hit = surface.sample(heldLat[next], heldLon[next]);
+        checked[next] = steps;
+        // On a miss (Google drops what is out of view), keep the estimate and
+        // confirm it later rather than every step.
+        urgent[next] = 0;
+        if (hit && Number.isFinite(hit.heightMeters)) {
+          const correction = hit.heightMeters - heldRaw[next] - provisional[next];
+          filters[next].shift(correction);
+          ground[next] += correction;
+          shift[next] += correction;
+          heldRaw[next] = hit.heightMeters; heldRevision[next] = hit.revision;
+          provisional[next] = 0;
+        }
+        // Then follow the contact to where it is now, if there is a sample to spare.
+        if (moved[next] >= spacing(next)) { wants[next] = SAMPLE_MOVED; rank[next] = moved[next] / spacing(next); }
+        continue;
+      }
+      const hit = surface.sample(footLat[next], footLon[next]);
+      // Keep the last sample over a hole; the move is retried next step.
+      if (!hit || !Number.isFinite(hit.heightMeters)) continue;
+      const fresh = kind === SAMPLE_FIRST;
+      ground[next] = filters[next].height(hit.heightMeters, fresh ? 0 : moved[next],
+        fresh || input.snap || input.altitude - down[next] - hit.heightMeters > WHEELS_CLEAR_METERS);
+      heldLat[next] = footLat[next]; heldLon[next] = footLon[next];
+      heldRaw[next] = hit.heightMeters; heldRevision[next] = hit.revision; checked[next] = steps;
+      provisional[next] = 0; urgent[next] = 0;
+    }
+  }
+
+  return {
+    /**
+     * The support plane for this step, or NaN when the centre's ground stands
+     * in; and how far the world's refinement moved the previous plane.
+     */
+    measure(input: SupportInput): typeof result {
+      const knownDelta = input.revisionChanged && Number.isFinite(input.cgDelta);
+      // Without contact samples the change under the centre is the change.
+      result.refinement = knownDelta ? input.cgDelta : 0;
+      result.elevation = Number.NaN;
+      if (live) {
+        for (let i = 0; i < count; i++) {
+          shift[i] = knownDelta ? input.cgDelta : 0;
+          if (!input.revisionChanged || Number.isNaN(heldRaw[i])) continue;
+          // Refinements are spatially coherent: the sample moves with the
+          // change measured under the centre until measured at its own spot.
+          if (knownDelta) {
+            filters[i].shift(input.cgDelta);
+            ground[i] += input.cgDelta;
+            provisional[i] += input.cgDelta;
+          }
+          if (input.urgent || !knownDelta) urgent[i] = 1;
+        }
+      }
+      const far = input.altitude - input.cgGround > FOOTPRINT_RANGE_METERS + reachMeters + 1;
+      const lowest = far ? Number.NaN : readGeometry(input);
+      const inRange = Number.isFinite(lowest) && input.altitude - lowest - input.cgGround < FOOTPRINT_RANGE_METERS;
+      if (inRange) {
+        live = true;
+        // A surface that throws abandons the step, and the samples it already
+        // gave with it, so no contact is left half a step on.
+        try { sampleFootprints(input); }
+        catch (error) { reset(); throw error; }
+      }
+      if (hadSupport) {
+        // The previous plane under the refined world, at the previous pose,
+        // chosen by the same rule. Reach is judged from where the aircraft
+        // stood, moved by the change measured without the contacts it decides
+        // on: under the centre, or else the least any supporting contact's
+        // ground moved. Otherwise a roof refined in over a wingtip would lift
+        // the plane that then judges the roof within reach.
+        let lift = Number.POSITIVE_INFINITY;
+        if (knownDelta) lift = input.cgDelta;
+        else for (let i = 0; i < count; i++) if (prevSupported[i]) lift = Math.min(lift, shift[i]);
+        const reachLevel = prevLevel + (Number.isFinite(lift) ? lift : 0);
+        let before = prevCgGround + prevLowest;
+        let after = before + (knownDelta ? input.cgDelta : 0);
+        for (let i = 0; i < count; i++) {
+          if (prevSupported[i]) before = Math.max(before, prevGround[i] + prevDown[i]);
+          if (!prevSampled[i]) continue;
+          // A contact's refined ground counts if it is within reach now,
+          // whether or not it was before.
+          const refined = prevGround[i] + shift[i];
+          if (!wheel[i] && refined > reachLevel - prevDown[i] + FOOTPRINT_REACH_METERS) continue;
+          after = Math.max(after, refined + prevDown[i]);
+        }
+        result.refinement = after - before;
+      }
+      if (!inRange) {
+        clearContacts();
+        return result;
+      }
+      const reference = Number.isFinite(input.previousElevation)
+        ? input.previousElevation + result.refinement : input.cgGround;
+      // Where the lowest contact would be resting on that plane, or is now.
+      const level = Math.max(input.altitude, reference + lowest);
+      let top = input.cgGround + lowest;
+      for (let i = 0; i < count; i++) {
+        supported[i] = 0;
+        if (!active[i] || Number.isNaN(ground[i])) continue;
+        if (!wheel[i] && ground[i] > level - down[i] + FOOTPRINT_REACH_METERS) {
+          margin[i] = FOOTPRINT_REACH_METERS;
+          continue;
+        }
+        supported[i] = 1;
+        top = Math.max(top, ground[i] + down[i]);
+      }
+      for (let i = 0; i < count; i++) {
+        prevSupported[i] = supported[i];
+        prevSampled[i] = active[i] && !Number.isNaN(ground[i]) ? 1 : 0;
+        if (!prevSampled[i]) continue;
+        prevGround[i] = ground[i];
+        prevDown[i] = down[i];
+        if (supported[i]) margin[i] = top - ground[i] - down[i];
+      }
+      prevCgGround = input.cgGround;
+      prevLowest = lowest;
+      prevLevel = level;
+      hadSupport = true;
+      result.elevation = top - lowest;
+      return result;
+    },
+    reset,
+    /** Whether it holds contact samples a switch to the kernel would lose. */
+    holdsContacts: (): boolean => reader !== null || live,
+  };
+}
+
+type SupportResult = ReturnType<ReturnType<typeof createReferenceSupport>["measure"]>;
+
+// SUPPORT.requestStride and SUPPORT.GEOMETRY_* of the kernel.
+const REQUEST_STRIDE = 6;
+const GEOMETRY_READ = 0, GEOMETRY_FAILED = 1, GEOMETRY_UNAVAILABLE = 2;
+
+/**
+ * `createReferenceSupport` on the core's contact-support kernel. The kernel
+ * keeps every contact's state; this side discovers the units, reads their
+ * properties into the kernel and samples the surface where it asks.
+ */
+function createWasmSupport(sdk: JSBSimSdk, surface: SurfaceQuery, core: GroundContactCore) {
+  let units: readonly GroundContactUnit[] = [];
+  let reader: ReturnType<typeof createPropertyReadBatch> | null = null;
+  let unavailable = false;
+  let kernel: WasmContactSupport | null = null;
+  let kernelUnits: readonly GroundContactUnit[] = [];
+  // Set while the SDK or the surface is called, whose errors are the caller's.
+  let inHost = false;
+  const result = { elevation: Number.NaN, refinement: 0 };
+
+  const sameUnits = (a: readonly GroundContactUnit[], b: readonly GroundContactUnit[]) => a.length === b.length
+    && a.every((unit, i) => unit.retractable === b[i].retractable && unit.prefix.startsWith("gear/") === b[i].prefix.startsWith("gear/"));
+
+  /** The reference's `discover`; a kernel for units it has not got replaces the forgotten one. */
+  function discover(): boolean {
+    if (reader) return true;
+    if (unavailable) return false;
+    inHost = true;
+    try { units = groundContactUnits(sdk); }
+    catch { unavailable = true; return false; }
+    finally { inHost = false; }
+    if (units.length === 0) { unavailable = true; return false; }
+    const paths = ["gear/num-units", "gear/gear-pos-norm", "inertia/cg-x-in", "inertia/cg-y-in", "inertia/cg-z-in"];
+    for (const unit of units) paths.push(`${unit.prefix}x-position`, `${unit.prefix}y-position`, `${unit.prefix}z-position`);
+    inHost = true;
+    reader = createPropertyReadBatch(sdk, paths);
+    inHost = false;
+    if (!kernel || !sameUnits(kernelUnits, units)) {
+      // The reference forgets the contacts but not its step count or its
+      // revalidation countdown, which the previous kernel hands on.
+      const next = core.createContactSupport(units, kernel ?? undefined);
+      kernel?.dispose();
+      kernel = next;
+      kernelUnits = units;
+    }
+    return true;
+  }
+
+  /** The reference's reset: the kernel forgets the contacts, and the units are found again. */
+  function reset(): void {
+    kernel?.reset();
+    reader?.dispose();
+    reader = null;
+    unavailable = false;
+  }
+
+  function fill(input: SupportInput): void {
+    const row = kernel!.input;
+    row[0] = input.lat; row[1] = input.lon; row[2] = input.altitude;
+    row[3] = input.roll; row[4] = input.pitch; row[5] = input.heading;
+    row[6] = input.cgGround; row[7] = input.revision; row[8] = input.revisionChanged ? 1 : 0;
+    row[9] = input.cgDelta; row[10] = input.urgent ? 1 : 0; row[11] = input.snap ? 1 : 0;
+    row[12] = input.samples; row[13] = input.previousElevation;
+  }
+
+  return {
+    /** Whether the last error thrown came from the SDK or the surface rather than the kernel. */
+    get hostError() { return inHost; },
+    measure(input: SupportInput): SupportResult {
+      inHost = false;
+      // Undiscovered, the reference reads the geometry whatever the height.
+      if (!kernel && !discover()) {
+        result.elevation = Number.NaN;
+        result.refinement = input.revisionChanged && Number.isFinite(input.cgDelta) ? input.cgDelta : 0;
+        return result;
+      }
+      fill(input);
+      let geometry = GEOMETRY_READ;
+      if (kernel!.wantsGeometry()) {
+        const before = kernel;
+        if (!discover()) geometry = GEOMETRY_UNAVAILABLE;
+        else {
+          if (kernel !== before) fill(input);
+          try { reader!.readInto(kernel!.values); }
+          catch {
+            // A model load disposes the native batch; find the contacts again.
+            reader?.dispose();
+            reader = null;
+            geometry = GEOMETRY_FAILED;
+          }
+        }
+      }
+      const planned = kernel!.plan(geometry);
+      // A changed unit count forgot the contacts, as the reference's forget() does.
+      if (geometry === GEOMETRY_READ && !kernel!.discovered) { reader?.dispose(); reader = null; }
+      const requests = kernel!.requests;
+      for (let k = 0; k < planned; k++) {
+        const at = k * REQUEST_STRIDE;
+        inHost = true;
+        let hit: ReturnType<SurfaceQuery["sample"]>;
+        try { hit = surface.sample(requests[at + 2], requests[at + 3]); }
+        catch (error) {
+          // Abandon the step rather than finish it half sampled, as the
+          // reference and the kernel's own measure() do.
+          inHost = false;
+          reset();
+          inHost = true;
+          throw error;
+        }
+        inHost = false;
+        requests[at + 4] = hit ? hit.heightMeters : Number.NaN;
+        requests[at + 5] = hit ? hit.revision : Number.NaN;
+      }
+      const output = kernel!.finish();
+      result.elevation = output[0];
+      result.refinement = output[1];
+      return result;
+    },
+    reset,
+    dispose(): void {
+      reader?.dispose();
+      reader = null;
+      kernel?.dispose();
+      kernel = null;
+    },
+  };
+}
+
+/**
+ * The reference, or the kernel when a core is supplied. They hand over only
+ * where neither holds contact samples, at the start and after a reset, so
+ * a core that loads in flight never drops the ground under a contact.
+ */
+function createContactSupport(sdk: JSBSimSdk, surface: SurfaceQuery, core: GroundContactCoreSource) {
+  const reference = createReferenceSupport(sdk, surface);
+  const slot = createKernelSlot(core, "wasm-contact-support", loaded => createWasmSupport(sdk, surface, loaded));
+  let onWasm = false;
+  return {
+    measure(input: SupportInput): SupportResult {
+      const kernel = slot.current;
+      if (kernel && (onWasm || !reference.holdsContacts())) {
+        onWasm = true;
+        try { return kernel.measure(input); }
+        catch (error) {
+          if (kernel.hostError) throw error;
+          slot.fail(error);
+          onWasm = false;
+        }
+      }
+      return reference.measure(input);
+    },
+    reset(): void {
+      reference.reset();
+      try { slot.current?.reset(); }
+      catch (error) { slot.fail(error); }
+      onWasm = false;
+    },
+    status(): GroundContactKernelStatus {
+      const status = slot.status();
+      // A core that arrived in flight waits for the next reset.
+      if (status.kernel === "single" && !onWasm && reference.holdsContacts()) {
+        return { ...status, kernel: "typescript", fallbackReason: "wasm-contact-support-pending: the reference holds contact samples until a reset" };
+      }
+      return status;
+    },
+    dispose(): void {
+      reference.reset();
+      slot.dispose();
+    },
+  };
+}
+
 export type TerrainBlockReason = "missing" | "coarse" | null;
 
 export function createTerrainContact(
   sdk: JSBSimSdk,
   surface: SurfaceQuery,
   clearanceProfile: AircraftClearanceStance,
+  /** A WASM ground-contact core, or its load, for the contact support plane. */
+  options: { core?: GroundContactCoreSource } = {},
 ) {
-  // `height` is the raw sample, used to detect the world changing. `ground` is
-  // what the wheels ride on and what JSBSim is given.
+  // `height` is the raw sample under the centre, used to detect the world
+  // changing. `ground` is the support plane the contacts ride on and JSBSim is
+  // given.
   let previous: { lat: number; lon: number; height: number; ground: number; revision: number; clearance: number; resting: boolean } | null = null;
   let placement = true;
   let hasReference = false;
@@ -82,9 +648,24 @@ export function createTerrainContact(
   let blindSteps = 0;
   let blockReason: TerrainBlockReason = null;
   const wheelGround = createWheelGroundFilter();
+  const contacts = createContactSupport(sdk, surface, options.core);
+  const supportInput: SupportInput = {
+    lat: 0, lon: 0, altitude: 0, roll: 0, pitch: 0, heading: 0, cgGround: 0, revision: 0,
+    revisionChanged: false, cgDelta: 0, urgent: false, snap: false, samples: 0, previousElevation: Number.NaN,
+  };
   return {
-    reset() { previous = null; placement = true; hasReference = false; rejectedSamples = 0; blindSteps = 0; blockReason = null; wheelGround.reset(); },
+    reset() {
+      previous = null; placement = true; hasReference = false; rejectedSamples = 0; blindSteps = 0; blockReason = null;
+      wheelGround.reset();
+      contacts.reset();
+    },
     getBlockReason: (): TerrainBlockReason => blockReason,
+    /** The kernel the support plane is measured on, and why it is not the WASM one if it was asked for. */
+    status: contacts.status,
+    /** Releases the contacts' property batch and the WASM kernel; the core stays the caller's. */
+    dispose(): void {
+      contacts.dispose();
+    },
     /**
      * `allowGoogleTerrainSurface` is the caller's World-detail policy. Google
      * `geometricError` describes tile simplification, not a measured vertical
@@ -161,32 +742,11 @@ export function createTerrainContact(
         });
       }
       const altitude = sdk.getPropertyValue("position/h-sl-ft") * 0.3048;
-      const clearance = aircraftClearanceMeters(
-        clearanceProfile,
-        sdk.getPropertyValue("attitude/phi-deg") * Math.PI / 180,
-        sdk.getPropertyValue("attitude/theta-deg") * Math.PI / 180,
-      );
-      let refinementDelta = 0;
-      if (previous && hit.revision !== previous.revision) {
-        // Compare two versions at ONE coordinate, never two heights along a flight path.
-        const anchor = surface.sample(previous.lat, previous.lon);
-        if (anchor && Number.isFinite(anchor.heightMeters)) refinementDelta = anchor.heightMeters - previous.height;
-      }
-      // A wheel rides its own footprint, not the point under the axle.
-      const movedMeters = previous ? Math.hypot((lat - previous.lat) * 111320,
-        (((lon - previous.lon + 540) % 360) - 180) * Math.cos(lat * Math.PI / 180) * 111320) : 0;
-      const ground = wheelGround.height(hit.heightMeters, movedMeters,
-        placement || blindSteps > 0 || hit.revision !== previous?.revision
-        || altitude - hit.heightMeters > WHEELS_CLEAR_METERS);
-      const support = ground + clearance;
-      const changedHere = Math.abs(refinementDelta) > 0.00001;
-      // Only repair penetration attributable to the world change. Moving into a
-      // hill while some other tile refines is still an ordinary collision.
-      const attributable = altitude + refinementDelta >= support - 0.1;
-      const followGround = changedHere && previous?.resting && attributable;
-      const liftedThroughPlane = refinementDelta > 0 && previous && previous.clearance >= -0.5
-        && altitude < support && attributable;
-      const penetration = support - altitude;
+      const roll = sdk.getPropertyValue("attitude/phi-deg") * Math.PI / 180;
+      const pitch = sdk.getPropertyValue("attitude/theta-deg") * Math.PI / 180;
+      const clearance = aircraftClearanceMeters(clearanceProfile, roll, pitch);
+      // Judged on the raw sample, before any filter adopts it.
+      const penetration = hit.heightMeters + clearance - altitude;
       // Placement is exempt from both limits: spawning at a mountain airport
       // legitimately puts the aircraft far below a surface it has never seen.
       const stepMeters = previous ? hit.heightMeters - previous.height : 0;
@@ -215,7 +775,48 @@ export function createTerrainContact(
         flightLog.info("terrain", "Surface samples are believable again", { ignoredSamples: rejectedSamples });
         rejectedSamples = 0;
       }
-      let corrected = false;
+      const revisionChanged = previous !== null && hit.revision !== previous.revision;
+      // NaN: the world changed and the change could not be measured.
+      let cgDelta = 0;
+      if (previous && revisionChanged) {
+        // Compare two versions at ONE coordinate, never two heights along a flight path.
+        const anchor = surface.sample(previous.lat, previous.lon);
+        cgDelta = anchor && Number.isFinite(anchor.heightMeters) ? anchor.heightMeters - previous.height : Number.NaN;
+      }
+      // A wheel rides its own footprint, not the point under the axle.
+      const movedMeters = previous ? Math.hypot((lat - previous.lat) * 111320,
+        (((lon - previous.lon + 540) % 360) - 180) * Math.cos(lat * Math.PI / 180) * 111320) : 0;
+      // A measured refinement moves the filtered ground with the surface, so the
+      // wheel keeps bridging the noise it was bridging instead of jolting.
+      if (revisionChanged && Number.isFinite(cgDelta)) wheelGround.shift(cgDelta);
+      const cgGround = wheelGround.height(hit.heightMeters, movedMeters,
+        placement || blindSteps > 0 || (revisionChanged && !Number.isFinite(cgDelta))
+        || altitude - hit.heightMeters > WHEELS_CLEAR_METERS);
+      const fresh = placement || blindSteps > 0;
+      supportInput.lat = lat; supportInput.lon = lon; supportInput.altitude = altitude;
+      supportInput.roll = roll; supportInput.pitch = pitch;
+      supportInput.heading = sdk.getPropertyValue("attitude/psi-deg") * Math.PI / 180;
+      supportInput.cgGround = cgGround;
+      supportInput.revision = hit.revision;
+      supportInput.revisionChanged = revisionChanged;
+      supportInput.cgDelta = cgDelta;
+      supportInput.urgent = !googleTiles || fresh || !(Math.abs(cgDelta) <= 0.00001);
+      supportInput.snap = fresh;
+      supportInput.samples = googleTiles && !fresh ? GOOGLE_FOOTPRINT_SAMPLES_PER_STEP : Number.POSITIVE_INFINITY;
+      supportInput.previousElevation = previous ? previous.ground : Number.NaN;
+      const measured = contacts.measure(supportInput);
+      const ground = Number.isFinite(measured.elevation) ? measured.elevation : cgGround;
+      const refinement = measured.refinement;
+      const support = ground + clearance;
+      // A changed world moves a resting aircraft with it, and lifts one it
+      // came up through. Moving by the change itself keeps the oleo
+      // compression and the integrator history; any penetration that was not
+      // the world's doing stays, so an aircraft that flew into a hill while
+      // some other tile refined is not lifted out of it.
+      const changedHere = Math.abs(refinement) > 0.00001;
+      const followGround = changedHere && previous?.resting === true;
+      const liftedThroughPlane = refinement > 0 && previous !== null && previous.clearance >= -0.5
+        && altitude < support;
       // Deliberately NOT a cause: an aircraft that flew into a hill in full
       // view of the surface is deep below it too, and lifting it out would fly
       // it through terrain. Only a world that changed under a level aircraft,
@@ -225,16 +826,14 @@ export function createTerrainContact(
       // aircraft from its nominal stance.
       const regained = blindSteps >= BLIND_STEPS && altitude < ground;
       const cause = (placement && altitude < support) ? "placement"
-        : regained ? "surface regained above the aircraft"
-          : liftedThroughPlane ? "surface lifted through the aircraft"
-            : followGround ? "resting aircraft followed the ground" : null;
+        : regained ? "surface regained above the aircraft" : null;
+      const follow = !cause && (followGround || liftedThroughPlane);
       blindSteps = 0;
       if (cause) {
-        const movedMeters = penetration;
-        if (Math.abs(movedMeters) > 1) {
+        if (Math.abs(support - altitude) > 1) {
           flightLog.info("terrain", `Repositioned onto the surface (${cause})`, {
-            movedMeters: Number(movedMeters.toFixed(2)),
-            refinementDeltaMeters: Number(refinementDelta.toFixed(2)),
+            movedMeters: Number((support - altitude).toFixed(2)),
+            refinementDeltaMeters: Number(refinement.toFixed(2)),
             terrainMeters: Number(hit.heightMeters.toFixed(2)),
           });
         }
@@ -245,15 +844,31 @@ export function createTerrainContact(
         // plane; remove only downward velocity into that plane.
         snapshot.initial["ic/vd-fps"] = Math.min(0, snapshot.initial["ic/vd-fps"]);
         restoreSimulation(sdk, snapshot);
-        corrected = true;
+      } else if (follow) {
+        if (Math.abs(refinement) > 1) {
+          flightLog.info("terrain", "Moved with a surface refinement", {
+            refinementDeltaMeters: Number(refinement.toFixed(2)),
+            terrainMeters: Number(hit.heightMeters.toFixed(2)),
+          });
+        }
+        // Only the position moves: velocities, rates, the oleo state and the
+        // integrators' history carry on, so nothing drops onto its springs.
+        sdk.setPropertyValue("position/h-sl-ft", (altitude + refinement) / 0.3048);
       }
       sdk.setPropertyValue("position/terrain-elevation-asl-ft", ground / 0.3048);
       const height = sdk.getPropertyValue("position/h-sl-ft") * 0.3048;
-      previous = { lat, lon, height: hit.heightMeters, ground, revision: hit.revision,
-        clearance: height - ground - clearance,
-        resting: height - ground <= clearance + 0.25 && Math.abs(sdk.getPropertyValue("velocities/v-down-fps")) < 3 };
+      const resting = height - ground <= clearance + 0.25 && Math.abs(sdk.getPropertyValue("velocities/v-down-fps")) < 3;
+      if (previous) {
+        previous.lat = lat; previous.lon = lon; previous.height = hit.heightMeters; previous.ground = ground;
+        previous.revision = hit.revision; previous.clearance = height - ground - clearance; previous.resting = resting;
+      } else {
+        previous = { lat, lon, height: hit.heightMeters, ground, revision: hit.revision,
+          clearance: height - ground - clearance, resting };
+      }
       placement = false;
-      return corrected ? "reset" : true;
+      // A move is still reported as a reset: the swept hull probes and the
+      // displayed interpolation must not span it.
+      return cause || follow ? "reset" : true;
     },
   };
 }

@@ -14,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { build } from "vite";
 import { newOutputDirectory } from "../../../../fly/scripts/outputDirectory.mjs";
-import { BODY_COLLISION_PROBES, SF50_BODY_COLLISION_PROBES } from "@0sfs/ground-contact/collisionGeometry";
+import { C172_BODY_COLLISION_PROBES, groundContactBodyPosition, SF50_BODY_COLLISION_PROBES } from "@0sfs/ground-contact/collisionGeometry";
 import { readAircraftGlb } from "./aircraftGeometry.mjs";
 import { generateProxies } from "./proxies.mjs";
 import { initialize, makeScenarios, prepareContactWindows, runTiming } from "./queries.mjs";
@@ -59,16 +59,29 @@ if (![config.directionCount, config.cases, config.rounds, config.minimumBlockMs]
 function hash(file) { return createHash("sha256").update(readFileSync(file)).digest("hex"); }
 function write(file, value) { writeFileSync(path.join(output, file), `${JSON.stringify(value, null, 2)}\n`); }
 
+/** The flight model's empty-weight CG, in structural inches. */
+function emptyCg(file) {
+  const xml = readFileSync(path.join(root, file), "utf8");
+  const location = /<location name="CG" unit="IN">([\s\S]*?)<\/location>/.exec(xml)?.[1] ?? "";
+  const axis = name => Number(new RegExp(`<${name}>\\s*([-\\d.]+)\\s*</${name}>`).exec(location)?.[1]);
+  return { xIn: axis("x"), yIn: axis("y"), zIn: axis("z") };
+}
+
 function prepare() {
   const profiles = readFileSync(path.join(root, "src/flight/jsbsim/fdmProfiles.ts"), "utf8");
   const assets = [
-    { id: "c172", file: "public/aircraft/cessna-172/Cessna_172_LOD3.glb", probes: BODY_COLLISION_PROBES,
+    { id: "c172", file: "public/aircraft/cessna-172/Cessna_172_LOD3.glb", probes: C172_BODY_COLLISION_PROBES,
+      cg: emptyCg("public/jsbsim-data/aircraft/c172p/c172p.xml"),
       stance: Number(/const C172_STATI =\s*\{\s*staticMeters:\s*([\d.]+)/.exec(profiles)?.[1]) },
     { id: "sf50", file: "public/aircraft/cirrus-vision-jet/Cirrus_Vision_Jet_LOD3.glb", probes: SF50_BODY_COLLISION_PROBES,
+      cg: emptyCg("public/jsbsim-data/aircraft/sf50/sf50.xml"),
       stance: Number(/const SF50_STATI =\s*\{\s*staticMeters:\s*([\d.]+)/.exec(profiles)?.[1]) },
   ];
   return assets.map(asset => {
     if (!Number.isFinite(asset.stance)) throw new Error("Could not read current aircraft visual stance");
+    if (![asset.cg.xIn, asset.cg.yIn, asset.cg.zIn].every(Number.isFinite)) throw new Error(`Could not read the ${asset.id} empty-weight CG`);
+    // The probes are hull points in structural inches; placed here from the empty-weight CG.
+    const points = asset.probes.map(probe => groundContactBodyPosition(probe, asset.cg));
     const original = readAircraftGlb(path.join(root, asset.file));
     const center = original.metadata.bounds.min.map((v, i) => (v + original.metadata.bounds.max[i]) / 2);
     const mesh = { id: asset.id,
@@ -79,9 +92,9 @@ function prepare() {
         pose: "GLB default rigid pose; gear included; control surfaces neutral; Propeller_Disc excluded" } };
     const generated = generateProxies(mesh, config);
     const legacy = { id: `legacy-${asset.probes.length}`, kind: "points", budget: asset.probes.length,
-      points: asset.probes.map(p => [-p.left - center[0], p.up + asset.stance - center[1], -p.forward - center[2]]),
+      points: points.map(p => [-p.left - center[0], p.up + asset.stance - center[1], -p.forward - center[2]]),
       metadata: { generationMs: 0, geometryBytes: asset.probes.length * 12,
-        note: "Current runtime probes mapped through current static visual offset into mesh frame; no CG-change test" } };
+        note: "Current runtime probes placed from the empty-weight CG and mapped through current static visual offset into mesh frame; no CG-change test" } };
     write(`${asset.id}-mesh.json`, mesh);
     console.log(`aircraft-collision: ${asset.id} extracted ${mesh.indices.length / 3} triangles, ${generated.candidates.length} generated candidates`);
     return { mesh, candidates: [legacy, ...generated.candidates], generation: generated.metadata,

@@ -67,6 +67,28 @@ ground callback, the WASM SDK binds no callback of ours, and the only terrain
 property is that single scalar. Three wheels cannot be given three heights
 without replacing the gear model outright.
 
+## One plane for every contact
+
+Under the centre of gravity alone, a sloped runway put the nose wheel or the
+tail under the surface, and a hillside put a wingtip into it. Within 10 m of
+the ground, `terrainContact.ts` samples the ground under every contact JSBSim
+reports, wheels and structure, placed from its structural inches and the live
+CG. The plane it gives JSBSim is the lowest at which no contact is deeper in
+its own ground than JSBSim's lowest contact is in the plane. That contact's
+spring then holds every other contact to at most its own compression.
+
+- The ground under the centre stays a floor under the plane, so a sample that
+  is deferred or missing never leaves the plane lower than before.
+- Ground more than a metre above where a structure contact would rest is not
+  support: a wingtip under an overhang or in a wall is for hull collision.
+- Google samples are limited to two contacts a step, the most overdue first.
+  A contact keeps its sample until it has moved at least 5 cm, and is
+  confirmed lazily while the ground under the centre does not change.
+
+A horizontal plane cannot pitch the aircraft onto a slope: the uphill contact
+carries it and the others ride clear of their ground. That needs a ground per
+contact in the native gear model.
+
 ## The ground a wheel rides on
 
 Because the surface is sampled at a point and resampled every physics step,
@@ -128,17 +150,62 @@ entire velocity vertical.
 
 ## Repositioning
 
-The aircraft is moved onto the surface for three reasons only:
+The aircraft is put onto the surface through JSBSim's initial conditions for two
+reasons only:
 
 - **placement** — the first frame at a new location,
+- **surface regained above the aircraft** — half a second without a surface
+  ended with the aircraft under ground it never saw.
+
+A refinement moves the aircraft by the change itself, in two cases:
+
 - **surface lifted through the aircraft** — a refinement raised the ground into
   a level aircraft,
-- **resting aircraft followed the ground** — a refinement lowered the ground
+- **resting aircraft followed the ground** — a refinement moved the ground
   under an aircraft standing on it.
+
+Only the altitude changes. Velocities, rates, oleo compression and the
+integrators' history carry on, so a parked aircraft does not drop back onto its
+springs each time a tile refines under it.
 
 An aircraft that flew into a hill in full view of the surface is deep below it
 too, and is deliberately left there: lifting it out would fly it through
 terrain. That case ends in a physics fault, which is the intended outcome.
+
+## Hull collision
+
+JSBSim knows only its plane. Two things keep the airframe out of the rest of the
+visible surface:
+
+- **Structure contacts.** Every aircraft package declares `STRUCTURE` contacts
+  at the nose, belly, tail and wingtips. A tailstrike, a wingtip scrape or a
+  gear-up landing on the plane meets JSBSim's own spring, damper and friction,
+  continuously. Gear up, the SF-50 rests on its belly contacts with its
+  reference point 0.54 m above the ground and the F-35B 0.12 m, at no more than
+  1.2 in and 1.5 in of compression.
+- **Hull probes.** `visibleMeshCollision.ts` sweeps a few points per airframe
+  (`*_BODY_COLLISION_PROBES` in `collisionGeometry.ts`) from one physics step to
+  the next against the drawn surface: buildings, trees, and terrain off the
+  plane. The points are in structural inches and placed with the live CG.
+  Points on a broad surface are swept a few inches inside the hull, so on the
+  plane the structure contacts meet it first.
+
+A swept point that crosses the surface is answered as a rigid-body impact at
+that point: restitution along the surface normal, Coulomb friction (μ 0.5)
+across it, applied to both the velocity and the body rates through the
+aircraft's mass and inertia tensor. A wingtip strike rolls the aircraft and
+yaws it toward the drag. Restitution is 0.25 unless the caller supplies its
+own, clamped to 0–2: the app uses 1.35 while arcade ground launches are on.
+Up to 1 a hit cannot add kinetic energy; above it, the hit adds energy on
+purpose. Several points struck in one step are resolved in the order they
+crossed. The aircraft is then
+moved out along the normal until the hull point clears the surface by a
+centimetre.
+
+The new state is written through JSBSim's initial conditions, the only way its
+velocities and rates can be set, so an impact still resets the integrators'
+history. Only position, velocity and rates change: controls, gear, engine and
+the terrain plane are kept.
 
 ## Diagnosing a fault
 
@@ -157,4 +224,6 @@ Useful log entries when the ground behaves oddly:
 - `First terrain height established` — the height, with coordinates.
 - `Ignoring a surface sample …` — a rejected sample and the geometry it came from.
 - `Flying without a measured surface` — the AGL at which the hold was skipped.
-- `Repositioned onto the surface (…)` — which of the three causes fired.
+- `Repositioned onto the surface (…)` — which of the two causes fired.
+- `Moved with a surface refinement` — a refinement of more than a metre moved
+  the aircraft with it.

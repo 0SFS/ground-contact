@@ -48,13 +48,29 @@ describe("flight frame surface queries", () => {
     const sample = vi.fn((lat: number) => hit(lat));
     const query = createFrameSurfaceQuery({ sample, raycast });
     query.beginFrame();
-    for (let lat = 0; lat < 20; lat++) expect(query.sample(lat, 0)?.heightMeters).toBe(lat);
-    expect(query.sample(19, 0)?.heightMeters).toBe(19);
-    expect(sample).toHaveBeenCalledTimes(21);
+    for (let lat = 0; lat < 70; lat++) expect(query.sample(lat, 0)?.heightMeters).toBe(lat);
+    expect(query.sample(69, 0)?.heightMeters).toBe(69);
+    expect(sample).toHaveBeenCalledTimes(71);
     const origin = { x: 1, y: 2, z: 3 }, direction = { x: 0, y: 0, z: -1 };
     query.raycast(origin, direction, 0.5);
     query.raycast(origin, direction, 0.5);
     expect(raycast).toHaveBeenCalledTimes(2);
     expect(raycast).toHaveBeenLastCalledWith(origin, direction, 0.5);
+  });
+
+  it("opens the surface's own frame for the tick and closes it once, before the world moves", () => {
+    const calls: string[] = [];
+    const surface: SurfaceQuery = { sample: () => { calls.push("sample"); return hit(300); }, raycast: () => { calls.push("raycast"); return null; },
+      beginFrame: () => calls.push("begin"), endFrame: () => calls.push("end") };
+    const query = createFrameSurfaceQuery(surface);
+    query.beginFrame();
+    query.sample(45, -93); query.raycast({ x: 1, y: 2, z: 3 }, { x: 0, y: 0, z: -1 }, 1);
+    query.endFrame(); query.endFrame();
+    // The view's sample after the frame still reuses the tick's height.
+    query.sample(45, -93);
+    expect(calls).toEqual(["begin", "sample", "raycast", "end"]);
+    // A surface without frames is queried as before.
+    const plain = createFrameSurfaceQuery({ sample: () => hit(1), raycast: () => null });
+    plain.beginFrame(); expect(plain.sample(1, 2)?.heightMeters).toBe(1); plain.endFrame();
   });
 });

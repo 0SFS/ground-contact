@@ -164,10 +164,69 @@ const initialProperties: Record<string, string> = {
   "ic/vn-fps": "velocities/v-north-fps", "ic/ve-fps": "velocities/v-east-fps", "ic/vd-fps": "velocities/v-down-fps",
   "ic/p-rad_sec": "velocities/p-rad_sec", "ic/q-rad_sec": "velocities/q-rad_sec", "ic/r-rad_sec": "velocities/r-rad_sec",
 };
-export function captureSimulation(sdk: JSBSimSdk) {
-  let capture = modelCaptures.get(sdk);
-  if (!capture) { capture = createSimulationCapture(sdk); modelCaptures.set(sdk, capture); }
+/** Everything restoreSimulation() needs to rebuild the model as it was captured. */
+export interface SimulationSnapshot {
+  /** JSBSim `ic/*` values: position, terrain, attitude, velocities and rates. */
+  initial: Record<string, number>;
+  /**
+   * Pilot controls with the restorable native state beside them: stores, fuel,
+   * engine thermal and plant state. Observed values, never synthesized by the app.
+   */
+  controls: Record<string, number>;
+  running: boolean;
+  /**
+   * Contact recovery rebuilds model state at zero integration time, but it is
+   * still part of the current flight. Preserving the public simulation clock
+   * keeps real-time consumers from mistaking every recovery for a seek.
+   */
+  simTimeS: number;
+}
+
+export function captureSimulation(sdk: JSBSimSdk): SimulationSnapshot {
+  const capture = simulationCapture(sdk);
   const values = capture.reader.read();
+  return snapshotFromValues(capture, values, simulationClock(sdk, values[capture.time]));
+}
+
+/**
+ * The step loop's copy of the state before each step. record() reads into an
+ * array kept for the model and builds nothing; snapshot() turns the last
+ * record into a SimulationSnapshot only when a step has to be undone.
+ */
+export interface SimulationRecorder {
+  record(): void;
+  snapshot(): SimulationSnapshot;
+}
+
+export function createSimulationRecorder(sdk: JSBSimSdk): SimulationRecorder {
+  let capture: SimulationCapture | null = null;
+  let values = new Float64Array(0);
+  let recorded = false;
+  return {
+    record(): void {
+      recorded = false;
+      // One lookup per step. A released model capture is rebuilt, and so is the array.
+      const current = simulationCapture(sdk);
+      if (current !== capture) { capture = current; values = new Float64Array(current.size); }
+      current.reader.readInto(values);
+      // The clock replaces its property's slot: kept in a closure variable, it would be boxed every step.
+      values[current.time] = simulationClock(sdk, values[current.time]);
+      recorded = true;
+    },
+    snapshot(): SimulationSnapshot {
+      if (!capture || !recorded) throw new Error("No simulation record to restore");
+      return snapshotFromValues(capture, values, values[capture.time]);
+    },
+  };
+}
+
+/** Some unit-test doubles implement the property reader without the SDK's getSimTime(); the installed runtime has it. */
+function simulationClock(sdk: JSBSimSdk, property: number): number {
+  const timing = sdk as JSBSimSdk & { getSimTime?: () => number };
+  return timing.getSimTime?.() ?? property;
+}
+
+function snapshotFromValues(capture: SimulationCapture, values: Float64Array, simTimeS: number): SimulationSnapshot {
   const initial: Record<string, number> = {};
   const snapshotControls: Record<string, number> = {};
   for (const [ic, index] of capture.initial) initial[ic] = values[index];
@@ -178,20 +237,16 @@ export function captureSimulation(sdk: JSBSimSdk) {
     const ready = values[initialized], kelvin = values[temperature];
     if (Number.isFinite(ready) && ready > 0.5 && Number.isFinite(kelvin) && kelvin > 0) snapshotControls[state] = kelvin;
   }
-  const timing = sdk as JSBSimSdk & { getSimTime?: () => number };
-  return { initial,
-    // The existing snapshot record includes restorable native state alongside
-    // pilot controls. These values are observed, never synthesized by the app.
-    controls: snapshotControls,
-    running: values[capture.running] > 0.5,
-    // Contact recovery rebuilds model state at zero integration time, but it is
-    // still part of the current flight. Preserve the public simulation clock so
-    // real-time consumers do not mistake every terrain refinement for a seek.
-    // Some unit-test doubles implement the property reader without the SDK's
-    // convenience method. The installed runtime supplies getSimTime().
-    simTimeS: timing.getSimTime?.() ?? values[capture.time] };
+  return { initial, controls: snapshotControls, running: values[capture.running] > 0.5, simTimeS };
 }
-export type SimulationSnapshot = ReturnType<typeof captureSimulation>;
+
+function simulationCapture(sdk: JSBSimSdk): SimulationCapture {
+  let capture = modelCaptures.get(sdk);
+  if (!capture) { capture = createSimulationCapture(sdk); modelCaptures.set(sdk, capture); }
+  return capture;
+}
+
+type SimulationCapture = ReturnType<typeof createSimulationCapture>;
 
 function createSimulationCapture(sdk: JSBSimSdk) {
   const paths: string[] = [];
@@ -209,9 +264,9 @@ function createSimulationCapture(sdk: JSBSimSdk) {
     const flag = thermalFlags.get(index);
     return flag === undefined || Number.isFinite(values[flag]) && values[flag] > 0.5;
   });
-  return { initial, controls, thermal, running, time, reader };
+  return { initial, controls, thermal, running, time, reader, size: paths.length };
 }
-const modelCaptures = new WeakMap<JSBSimSdk, ReturnType<typeof createSimulationCapture>>();
+const modelCaptures = new WeakMap<JSBSimSdk, SimulationCapture>();
 
 /** Free native views before their SDK and discard cached model capabilities. */
 export function releaseSimulationCapture(sdk: JSBSimSdk): void {

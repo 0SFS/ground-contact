@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "core": "ground_contact",
+  "abiVersion": 2,
+  "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+  "optimizer": "wasm-opt version 132",
+  "node": "26.9.0",
+  "target": "wasm32-unknown-unknown",
+  "build": {
+    "command": [
+      "cargo",
+      "+stable",
+      "build",
+      "-p",
+      "ground-contact",
+      "--release",
+      "--locked",
+      "--offline",
+      "--target",
+      "wasm32-unknown-unknown"
+    ],
+    "rustflags": "-C target-feature=+simd128 -C link-arg=--max-memory=33554432",
+    "optimize": [
+      "wasm-opt",
+      "-O3",
+      "--enable-simd",
+      "--strip-debug"
+    ]
+  },
+  "inputs": {
+    "Cargo.lock": "fc065afa5809856e18717f9963841e89fc2feb270916f7e750d2f2a62cd5bd72",
+    "Cargo.toml": "99a8c87cb000bf8fe33f7094ec4ff72a3cd44da44d069cf2378f9d884cbddf56",
+    "crates/ground-contact/Cargo.toml": "0a9038fbb21dd987a823401e311647a96425e31ec0585d25038ba399bb380795",
+    "crates/ground-contact/src/geo.rs": "ee7afb584acb96953fd9c5a224ec0bd868131eec2210e62d39a0c9e4a3c316eb",
+    "crates/ground-contact/src/hull.rs": "9a9ee99532f4067a15e85484ba5204c53856a85ce9fc26b77b2fccdda4cc10c6",
+    "crates/ground-contact/src/jsmath.rs": "1f55d20a75d81a10f345b2552055eeeed6ed58f902537957a3abf1b0d3e193c8",
+    "crates/ground-contact/src/lib.rs": "5c9fede38be841cfc9b0589727d32150e542bb163dfb7e41a214724ff60e655d",
+    "crates/ground-contact/src/spin.rs": "1630f80aab0d176e4c5fdcc60af17bcff4a3cf3350632638dc9c8e5282bb630e",
+    "crates/ground-contact/src/support.rs": "1475f1cd92da503bebaaba567ce3e82a9e49404444d0bd0ac61f7c2090e0c889",
+    "crates/ground-contact/src/wheels.rs": "3bcac42c74271ebb6cfa2a9a58638608737652aa5cdc20cb69666801297e0348",
+    "index.d.ts": "ab895eaa252935e09287ad76b881d00331dd25929f031a679535cdeae7819ea8",
+    "index.js": "fe1799540b9bc4cc65faa8dd95e51c3b10067f85493d34e6273008d511636e6e",
+    "rust-toolchain.toml": "ef4d1f56bd8d2d2644df4c2c5786dc149046cd43048f4550420d77a8829f9e53",
+    "scripts/build.mjs": "716db0bb19c1a724ffe9df1ac3b8945fb960fc93fbb8bf348f7d7a66666c511d",
+    "toolchain.lock.json": "9f932e04abff3dbc36646838c3573b9b65a2801b6a4672a5c654b0114e415406"
+  },
+  "outputs": {
+    "single/ground_contact.wasm": {
+      "sha256": "4acb1764647cd58d60a4d6b4023a93c5eff56f4cbd14cccd12bdb1cedface259",
+      "bytes": 74466
+    }
+  },
+  "threaded": false,
+  "functionality": "build receipt only; parity evidence comes from scripts/check.mjs",
+  "performance": "unmeasured",
+  "power": "unmeasured"
+}

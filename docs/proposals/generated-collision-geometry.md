@@ -1,6 +1,6 @@
 # Collision geometry generated from the aircraft's mesh
 
-Status: Proposed, nothing built
+Status: Proposed. The hand-written groundwork it assumed is built (2026-10-27); generation is not
 Date: 2026-10-05
 Scope: 0SFS body collision (`src/flight/physics/collisionGeometry.ts`,
 `src/flight/physics/visibleMeshCollision.ts`), the Debug tab's collision overlay,
@@ -8,24 +8,29 @@ and the structure contacts in the aircraft packages. The Vision Jet first.
 
 ## Where it stands
 
+Updated 2026-10-27, after the [ground physics overhaul](ground-physics-overhaul.md)
+(Stage 3). When this was proposed, the Vision Jet's six points were fixed
+offsets from its empty CG, every other airframe got five generic points, the jet
+packages declared no `STRUCTURE` contacts, and the Debug overlay drew the generic
+points and the C172's contacts for every aircraft. Now:
+
 - Body collision is a short list of points per airframe, swept between physics
   steps against the visible map ([visible-mesh-flight-collision.md](visible-mesh-flight-collision.md),
-  Stage 2). The Vision Jet's six were read off a three-view
-  (`SF50_BODY_COLLISION_PROBES`). Every other airframe gets five generic points
-  (`BODY_COLLISION_PROBES`). Nothing checks either list against the mesh.
-- The jet's points are fixed offsets from its empty CG. As fuel moves the CG, the
-  points move with it, and so shift against the airframe. The C172's ground
-  contacts are kept in structural inches and converted with the live CG each
-  update (`groundContactBodyPosition`), which is the right way.
-- The SF50 packages declare three `BOGEY` contacts and no `STRUCTURE` contacts.
-  The C172 declares four structure contacts: a nose skid, a tail skid and both
-  wing tips. A jet whose wing tip or tail touches the runway never reaches
-  JSBSim's ground reactions. Only the swept points see it, and they answer with
-  a rewind and a bounce, not a contact force with friction.
-- The Debug overlay draws the generic points and the C172's contacts for every
-  aircraft. That fault is fixed separately (TODO.md, "collision"), and before
-  this work, because it is how this work gets looked at.
-- Every new aircraft means another hand-written list.
+  Stage 2). The C172, SF-50 and F-35B each have their own, at most six, in
+  structural inches and placed with the live CG (`groundContactBodyPosition`),
+  so they stay put on the airframe as fuel moves the CG. The generic list is
+  gone.
+- Every package declares `STRUCTURE` contacts. The C172 has a nose skid, tail
+  skid, belly, tail and both wingtips; the SF-50's three packages a nose skid,
+  four belly points, a tail skid and both wingtips; the F-35B the same plus the
+  stabilators' trailing edges. A wingtip or tail on the runway meets JSBSim's
+  spring, damper and friction, and the swept points answer everything off the
+  plane with a rigid-body impulse.
+- The Debug overlay draws the current aircraft's probes and every contact the
+  model reports, at the live CG.
+- Nothing checks the points against the mesh. They are read off three-views
+  and the JSBSim files, and miss leading edges. Every new aircraft still means
+  another hand-written list, which is what remains of this proposal.
 
 ## The approach
 

@@ -66,9 +66,9 @@ Acceptance:
 
 ### Stage 2: swept body contacts
 
-Before each JSBSim step, construct five short swept probes from the previous
-to predicted aircraft-local positions: nose, main gear/CG, both wing tips, and
-tail. Query only the active map meshes through `SurfaceQuery.raycast`; cap the
+Before each JSBSim step, construct a few short swept probes (at most six) from
+the previous to predicted aircraft-local positions: nose, main gear/CG, both
+wing tips, and tail. Query only the active map meshes through `SurfaceQuery.raycast`; cap the
 probe length and candidate work. A hit supplies position and normal.
 
 On a body hit, restore the last valid JSBSim snapshot, move it to the contact
@@ -91,8 +91,8 @@ trees, building walls, shallow landings and intentional high-speed crashes.
 
 - Stage 1: raster retains its measured direct tile lookup; Google uses one
   vertical ray query only while visible geometry exists.
-- Stage 2: maximum five probes per 120 Hz substep, with no whole-scene scan and
-  no allocations in the steady path.
+- Stage 2: maximum six probes per 120 Hz substep (the SF-50's), with no
+  whole-scene scan and no allocations in the steady path.
 - Capture query count, probe hits, candidate triangles, fallback scans and
   contact CPU time through opt-in bounded diagnostics. Establish browser P95
   before enabling Stage 2 by default.
@@ -121,7 +121,7 @@ trees, building walls, shallow landings and intentional high-speed crashes.
 ## Rollout
 
 Stage 1 and fault recovery are complete. Stage 2 is enabled as a bounded
-gameplay experiment: it uses at most five short probes and only within 150 m of
+gameplay experiment: it uses at most six short probes and only within 150 m of
 the sampled visible surface. Retain it only after browser testing demonstrates
 acceptable frame pacing and more reliable obstacle contacts than vertical
 support alone.

@@ -3,6 +3,8 @@
  * This module never changes aircraft forces or collision response.
  * Slip energy is a feedback-model quantity, not aircraft energy loss.
  */
+import { createKernelSlot, type GroundContactCoreSource, type GroundContactKernelStatus } from "./groundContactCore";
+
 export type WheelSpinMode = "instant" | "inertia";
 
 export interface WheelSpinConfig {
@@ -155,4 +157,83 @@ export function stepWheelSpin(
   state.omegaRadSec = omega;
   state.slipMetersSec = input.onGround && mode === "inertia" ? speed - radius * omega : 0;
   state.slipPowerWatts = heat / seconds;
+}
+
+export interface WheelSpinStepper {
+  /** `stepWheelSpin` for wheel i with configs[i] and inputs[i]; on the WASM kernel when one is ready. */
+  step(states: WheelSpinState[], configs: readonly WheelSpinConfig[], inputs: readonly WheelSpinInput[],
+    dt: number, mode: WheelSpinMode): void;
+  status(): GroundContactKernelStatus;
+  dispose(): void;
+}
+
+const SPIN_STRIDE = 20;
+const SPIN_CONFIG = 9;
+const SPIN_INPUT = 14;
+
+/**
+ * `stepWheelSpin` for `wheelCount` wheels, delegated to the core's
+ * `createWheelSpin` when one is supplied. Identical to the reference, value
+ * for value; without a core, or for a call the kernel cannot take, it is the
+ * reference.
+ */
+export function createWheelSpinStepper(wheelCount: number, options: { core?: GroundContactCoreSource } = {}): WheelSpinStepper {
+  const slot = createKernelSlot(options.core, "wasm-wheel-spin", core => core.createWheelSpin(wheelCount));
+  const reference = (states: WheelSpinState[], configs: readonly WheelSpinConfig[], inputs: readonly WheelSpinInput[],
+    dt: number, mode: WheelSpinMode) => {
+    for (let index = 0; index < states.length; index++) stepWheelSpin(states[index], configs[index], inputs[index], dt, mode);
+  };
+  return {
+    step(states, configs, inputs, dt, mode) {
+      const kernel = slot.current;
+      if (!kernel) return reference(states, configs, inputs, dt, mode);
+      if (!Number.isFinite(dt) || dt <= 0) return;
+      if (states.length !== kernel.wheelCount || configs.length < states.length || inputs.length < states.length) {
+        slot.refuse(`${states.length} wheels for a ${kernel.wheelCount}-wheel kernel`);
+        return reference(states, configs, inputs, dt, mode);
+      }
+      if (mode !== "instant" && mode !== "inertia") {
+        slot.refuse(`mode ${String(mode)}`);
+        return reference(states, configs, inputs, dt, mode);
+      }
+      try {
+        const rows = kernel.wheels;
+        for (let index = 0, at = 0; index < states.length; index++, at += SPIN_STRIDE) {
+          const state = states[index], config = configs[index], input = inputs[index];
+          rows[at] = state.angleRad;
+          rows[at + 1] = state.omegaRadSec;
+          rows[at + SPIN_CONFIG] = config.radiusMeters;
+          rows[at + SPIN_CONFIG + 1] = config.widthMeters;
+          rows[at + SPIN_CONFIG + 2] = config.inertiaKgMetersSquared;
+          rows[at + SPIN_CONFIG + 3] = config.frictionCoefficient;
+          rows[at + SPIN_CONFIG + 4] = config.maxBrakeTorqueNewtonMeters;
+          rows[at + SPIN_INPUT] = input.onGround ? 1 : 0;
+          rows[at + SPIN_INPUT + 1] = input.rollMetersSec;
+          rows[at + SPIN_INPUT + 2] = input.normalLoadNewtons;
+          rows[at + SPIN_INPUT + 3] = input.compressionMeters;
+          rows[at + SPIN_INPUT + 4] = input.steeringRad;
+          rows[at + SPIN_INPUT + 5] = input.brake;
+        }
+        kernel.run(dt, mode);
+      } catch (error) {
+        slot.fail(error);
+        return reference(states, configs, inputs, dt, mode);
+      }
+      const rows = kernel.wheels;
+      for (let index = 0, at = 0; index < states.length; index++, at += SPIN_STRIDE) {
+        const state = states[index];
+        state.angleRad = rows[at];
+        state.omegaRadSec = rows[at + 1];
+        state.slipMetersSec = rows[at + 2];
+        state.slipPowerWatts = rows[at + 3];
+        state.onGround = rows[at + 4] === 1;
+        state.compressionMeters = rows[at + 5];
+        state.steeringRad = rows[at + 6];
+        state.normalLoadNewtons = rows[at + 7];
+        state.treadTravelMeters = rows[at + 8];
+      }
+    },
+    status: slot.status,
+    dispose: slot.dispose,
+  };
 }

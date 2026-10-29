@@ -3,18 +3,21 @@ import {
   Color3, Constants, Material, CreateLineSystem, CreateSphere, StandardMaterial, TransformNode, Vector3, VertexBuffer,
   type LinesMesh, type Mesh, type Scene,
 } from "@babylonjs/core";
-import { BODY_COLLISION_PROBES, C172_GROUND_CONTACTS, groundContactBodyPosition } from "./collisionGeometry";
+import { groundContactBodyPosition, type BodyCollisionProbe } from "./collisionGeometry";
+import { groundContactUnits, type GroundContactUnit } from "./groundContactClearance";
 
 type MarkerKind = "body" | "wheel" | "structure" | "cg";
 const COLORS: Record<MarkerKind, string> = {
   body: "#39dfff", wheel: "#ffbb46", structure: "#cc82ff", cg: "#ffffff",
 };
 
-/** Shows the actual point contacts, not an invented solid collision hull.
+/** Shows the actual point contacts, not an invented solid collision hull:
+ * the points the hull probes sweep, and the loaded model's JSBSim contacts.
  * Local coordinates are aircraft left/up/forward in metres, centred on its CG.
  * Marker sizes and spokes are visibility aids, not physical collision geometry.
  */
-export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode, sdk: JSBSimSdk) {
+export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode, sdk: JSBSimSdk,
+  probes: readonly BodyCollisionProbe[]) {
   let enabled = false;
   let disposed = false;
   let root: TransformNode | null = null;
@@ -22,10 +25,18 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
   const materials: StandardMaterial[] = [];
   const bodyMarkers: Mesh[] = [];
   const groundMarkers: Mesh[] = [];
-  const guidePositions = new Float32Array((BODY_COLLISION_PROBES.length + C172_GROUND_CONTACTS.length) * 6);
+  // Each contact's x, y and z position properties, three per contact.
+  let contactPaths: string[] = [];
+  let guidePositions = new Float32Array(0);
   const lastCg = { xIn: NaN, yIn: NaN, zIn: NaN };
+  const contact = { xIn: 0, yIn: 0, zIn: 0 };
+  const offset = { left: 0, up: 0, forward: 0 };
 
   function createGeometry(): void {
+    // A model that does not report its contacts completely shows its probes alone.
+    let contacts: readonly GroundContactUnit[] = [];
+    try { contacts = groundContactUnits(sdk); } catch { /* None to show. */ }
+    contactPaths = contacts.flatMap(({ prefix }) => ["x", "y", "z"].map(axis => `${prefix}${axis}-position`));
     root = new TransformNode("collision-debug", scene);
     root.parent = parent;
     root.doNotSerialize = true;
@@ -61,17 +72,20 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
     }
 
     marker("cg", "center-of-gravity");
-    for (const probe of BODY_COLLISION_PROBES) {
+    // Both kinds follow the CG, so they stay hidden until update() reads one.
+    for (const probe of probes) {
       const mesh = marker("body", probe.name);
-      mesh.position.set(probe.left, probe.up, probe.forward);
+      mesh.isVisible = false;
       bodyMarkers.push(mesh);
     }
-    for (const contact of C172_GROUND_CONTACTS) {
-      const mesh = marker(contact.kind, contact.name);
+    for (const { prefix } of contacts) {
+      // BOGEY units are under gear/, STRUCTURE units under contact/.
+      const mesh = marker(prefix.startsWith("gear/") ? "wheel" : "structure", prefix.slice(0, -1));
       mesh.isVisible = false;
       groundMarkers.push(mesh);
     }
     const markers = [...bodyMarkers, ...groundMarkers];
+    guidePositions = new Float32Array(markers.length * 6);
     guides = CreateLineSystem("collision-debug/guides", {
       lines: markers.map(mesh => [Vector3.Zero(), mesh.position]), updatable: true,
     }, scene);
@@ -90,10 +104,13 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       guideMaterial.depthFunction = Constants.ALWAYS;
       guideMaterial.disableDepthWrite = true;
     }
-    for (let index = 0; index < bodyMarkers.length; index++) {
-      bodyMarkers[index].position.toArray(guidePositions, index * 6 + 3);
-    }
-    guides.updateVerticesData(VertexBuffer.PositionKind, guidePositions);
+  }
+
+  function place(mesh: Mesh, known: boolean, left: number, up: number, forward: number, line: number): void {
+    mesh.isVisible = known;
+    if (known) mesh.position.set(left, up, forward);
+    else mesh.position.setAll(0);
+    mesh.position.toArray(guidePositions, line * 6 + 3);
   }
 
   function update(): void {
@@ -104,18 +121,21 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
     const valid = Number.isFinite(xIn) && Number.isFinite(yIn) && Number.isFinite(zIn);
     if (valid && xIn === lastCg.xIn && yIn === lastCg.yIn && zIn === lastCg.zIn) return;
     lastCg.xIn = xIn; lastCg.yIn = yIn; lastCg.zIn = zIn;
+    // Hide what the CG cannot place and collapse its guide, instead of
+    // showing NaNs or a plausible-looking position based on a guessed CG.
+    for (let index = 0; index < bodyMarkers.length; index++) {
+      const probe = probes[index];
+      groundContactBodyPosition(probe, lastCg, offset);
+      // The point the probe sweeps sits its inset above the hull point.
+      place(bodyMarkers[index], valid, offset.left, offset.up + probe.insetIn * 0.0254, offset.forward, index);
+    }
     for (let index = 0; index < groundMarkers.length; index++) {
-      const mesh = groundMarkers[index];
-      mesh.isVisible = valid;
-      if (valid) {
-        const position = groundContactBodyPosition(C172_GROUND_CONTACTS[index], lastCg);
-        mesh.position.set(position.left, position.up, position.forward);
-      } else {
-        // Hide unknown contacts and collapse their guides, instead of showing
-        // NaNs or a plausible-looking position based on a guessed CG.
-        mesh.position.setAll(0);
-      }
-      mesh.position.toArray(guidePositions, (bodyMarkers.length + index) * 6 + 3);
+      contact.xIn = sdk.getPropertyValue(contactPaths[index * 3]);
+      contact.yIn = sdk.getPropertyValue(contactPaths[index * 3 + 1]);
+      contact.zIn = sdk.getPropertyValue(contactPaths[index * 3 + 2]);
+      groundContactBodyPosition(contact, lastCg, offset);
+      const known = valid && Number.isFinite(contact.xIn) && Number.isFinite(contact.yIn) && Number.isFinite(contact.zIn);
+      place(groundMarkers[index], known, offset.left, offset.up, offset.forward, bodyMarkers.length + index);
     }
     guides.updateVerticesData(VertexBuffer.PositionKind, guidePositions);
   }

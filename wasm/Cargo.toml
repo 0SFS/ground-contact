@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/ground-contact"]
+exclude = ["build"]
+resolver = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

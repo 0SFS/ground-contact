@@ -1,6 +1,9 @@
+import { getHeapSpaceStatistics } from "node:v8";
 import { describe, expect, it, vi } from "vitest";
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
-import { captureSimulation, releaseSimulationCapture, restoreSimulation } from "../src/safeFlightState";
+import {
+  captureSimulation, createSimulationRecorder, releaseSimulationCapture, restoreSimulation,
+} from "../src/safeFlightState";
 
 const thermal = (index?: number) => `propulsion/engine${index === undefined ? "" : `[${index}]`}/thermal/`;
 const statePath = (index?: number) => `${thermal(index)}metal-temperature-state-k`;
@@ -267,5 +270,132 @@ describe("batched simulation capture", () => {
     b.batches[0].read.mockImplementationOnce(() => { throw new Error("Native read failed"); });
     expect(() => captureSimulation(t.native)).toThrow("Native read failed");
     releaseSimulationCapture(t.native);
+  });
+});
+
+describe("pre-step simulation records", () => {
+  function withBatch(t: ReturnType<typeof fixture>) {
+    const reads: Float64Array[] = [];
+    const createPropertyBatch = vi.fn((paths: readonly string[]) => ({
+      missing: [], dispose: vi.fn(),
+      read: (target: Float64Array) => {
+        reads.push(target);
+        target.set(paths.map(path => t.values[path] ?? 0));
+        return target;
+      },
+    }));
+    Object.assign(t.sdk, { createPropertyBatch });
+    return { reads, createPropertyBatch };
+  }
+
+  it("records into one array of its own and builds the captured snapshot only when asked", () => {
+    const prefix = "propulsion/engine[2]/plant/state/";
+    const t = fixture([`${statePath()} (RW)`, `${initializedPath()} (R)`,
+      `${statePath(3)} (RW)`, `${initializedPath(3)} (R)`, `${prefix}spool-rpm (RW)`, `${prefix}commit (RW)`]);
+    Object.assign(t.values, { [initializedPath(3)]: 0, [prefix + "spool-rpm"]: 6500,
+      "fcs/brake-cmd-norm": 0.4, "position/h-sl-ft": 1200 });
+    const b = withBatch(t);
+    Object.assign(t.sdk, { getSimTime: () => 42.5 });
+    const recorder = createSimulationRecorder(t.native);
+    expect(() => recorder.snapshot()).toThrow("No simulation record to restore");
+    recorder.record();
+    const expected = captureSimulation(t.native);
+    expect(expected.simTimeS).toBe(42.5);
+    expect(expected.controls).not.toHaveProperty(statePath(3));
+    expect(recorder.snapshot()).toEqual(expected);
+
+    // Later reads through the shared capture, and the step itself, leave the record alone.
+    Object.assign(t.values, { [prefix + "spool-rpm"]: 7000, "position/h-sl-ft": 900 });
+    captureSimulation(t.native);
+    expect(recorder.snapshot()).toEqual(expected);
+    expect(recorder.snapshot()).not.toBe(recorder.snapshot());
+
+    for (let step = 0; step < 50; step++) recorder.record();
+    expect(recorder.snapshot().controls[prefix + "spool-rpm"]).toBe(7000);
+    expect(recorder.snapshot().initial["ic/h-sl-ft"]).toBe(900);
+    // The capture's shared array and the recorder's own one: nothing allocated per record.
+    expect(new Set(b.reads).size).toBe(2);
+    expect(b.reads.slice(-50).every(target => target === b.reads.at(-1))).toBe(true);
+    expect(b.createPropertyBatch).toHaveBeenCalledOnce();
+    expect(t.sdk.getPropertyValue).not.toHaveBeenCalled();
+
+    // A released model capture is rebuilt, and the recorder follows it.
+    releaseSimulationCapture(t.native);
+    t.values["position/h-sl-ft"] = 800;
+    recorder.record();
+    expect(b.createPropertyBatch).toHaveBeenCalledTimes(2);
+    expect(recorder.snapshot().initial["ic/h-sl-ft"]).toBe(800);
+    restoreSimulation(t.native, recorder.snapshot());
+    expect(t.sdk.setSimTime).toHaveBeenCalledWith(42.5);
+    expect(t.values["ic/h-sl-ft"]).toBe(800);
+    releaseSimulationCapture(t.native);
+  });
+
+  it("reads scalar backends into the recorder's array too, lazily for pending thermal state", () => {
+    const t = fixture();
+    t.values[initializedPath(3)] = 0;
+    const recorder = createSimulationRecorder(t.native);
+    recorder.record();
+    expect(recorder.snapshot()).toEqual(captureSimulation(t.native));
+    expect(recorder.snapshot().simTimeS).toBe(42);
+    expect(t.sdk.getPropertyValue).not.toHaveBeenCalledWith(statePath(3));
+    releaseSimulationCapture(t.native);
+  });
+
+  /** A model whose batch copies from a fixed array, so the double allocates nothing per read. */
+  function quietModel() {
+    let source = new Float64Array(0);
+    const catalog = [`${statePath()} (RW)`, `${initializedPath()} (R)`];
+    const sdk = {
+      getPropertyValue: () => 0,
+      setPropertyValue: () => {},
+      queryPropertyCatalog: (query: string) => catalog.filter(line => line.startsWith(query)).join("\n"),
+      createPropertyBatch: (paths: readonly string[]) => {
+        source = new Float64Array(paths.map((path, slot) => path === initializedPath() ? 1 : slot + 0.25));
+        return { missing: [], dispose: () => {}, read: (target: Float64Array) => { target.set(source); return target; } };
+      },
+      getSimTime: () => 42,
+    };
+    return sdk as unknown as JSBSimSdk;
+  }
+
+  /** Young-generation bytes in use. Only allocation grows them; a scavenge empties them. */
+  function youngBytes(): number {
+    let bytes = 0;
+    for (const space of getHeapSpaceStatistics()) {
+      if (space.space_name === "new_space" || space.space_name === "new_large_object_space") bytes += space.space_used_size;
+    }
+    return bytes;
+  }
+
+  /** The median growth over nine windows of `calls` calls: a window a scavenge cut short is an outlier. */
+  function youngGrowth(work: () => void, calls: number): number {
+    const growth: number[] = [];
+    for (let window = 0; window < 9; window++) {
+      const before = youngBytes();
+      for (let call = 0; call < calls; call++) work();
+      growth.push(youngBytes() - before);
+    }
+    return growth.sort((a, b) => a - b)[4];
+  }
+
+  it("allocates nothing per record, where a full capture builds its records every call", () => {
+    const sdk = quietModel();
+    const recorder = createSimulationRecorder(sdk);
+    const nothing = () => {};
+    const capture = () => { captureSimulation(sdk); };
+    // Past first-call setup, lazy feedback and tier-up.
+    for (let call = 0; call < 20_000; call++) { recorder.record(); nothing(); }
+    for (let call = 0; call < 2_000; call++) capture();
+    const calls = 4_000;
+    // The windows' own bookkeeping is the baseline. One heap number per
+    // record would add 16 bytes a call; any allocation adds at least 8.
+    const baseline = youngGrowth(nothing, calls);
+    expect(youngGrowth(recorder.record, calls) - baseline).toBeLessThan(calls);
+    // The same measurement sees the snapshot a capture builds.
+    expect(youngGrowth(capture, 50) - youngGrowth(nothing, 50)).toBeGreaterThan(50 * 100);
+    expect(recorder.snapshot().simTimeS).toBe(42);
+    expect(recorder.snapshot().controls[statePath()]).toBeGreaterThan(0);
+    releaseSimulationCapture(sdk);
   });
 });

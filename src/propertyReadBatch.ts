@@ -17,14 +17,21 @@ export function createPropertyReadBatch(
   // Keep that behavior for absent optional controls without hiding live NaNs.
   const missing = new Set(batch?.missing ?? []);
   const scalarSlots = paths.flatMap((path, index) => !batch || missing.has(path) ? [index] : []);
+  const readInto = (target: Float64Array): Float64Array => {
+    if (target.length !== paths.length) throw new RangeError(`Expected ${paths.length} slots, got ${target.length}.`);
+    if (batch) batch.read(target);
+    // An indexed loop: a for-of iterator would be an allocation per read.
+    for (let slot = 0; slot < scalarSlots.length; slot++) {
+      const index = scalarSlots[slot];
+      target[index] = !canReadScalar || canReadScalar(index, target) ? sdk.getPropertyValue(paths[index]) : Number.NaN;
+    }
+    return target;
+  };
   return {
-    read(): Float64Array {
-      if (batch) batch.read(values);
-      for (const index of scalarSlots) {
-        values[index] = !canReadScalar || canReadScalar(index, values) ? sdk.getPropertyValue(paths[index]) : Number.NaN;
-      }
-      return values;
-    },
+    /** The values in slot order, in an array this batch reuses on every read. */
+    read: (): Float64Array => readInto(values),
+    /** The values in slot order, written into the caller's array (one slot per path). */
+    readInto,
     dispose(): void { batch?.dispose(); batch = null; },
   };
 }

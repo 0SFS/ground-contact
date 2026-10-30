@@ -160,13 +160,28 @@ reasons only:
 A refinement moves the aircraft by the change itself, in two cases:
 
 - **surface lifted through the aircraft** — a refinement raised the ground into
-  a level aircraft,
+  a level aircraft, above its lowest contact,
 - **resting aircraft followed the ground** — a refinement moved the ground
   under an aircraft standing on it.
 
 Only the altitude changes. Velocities, rates, oleo compression and the
 integrators' history carry on, so a parked aircraft does not drop back onto its
 springs each time a tile refines under it.
+
+Standing is judged by the contacts, not the stance: the lowest active contact is
+within 2 cm of JSBSim's floor or pressed into it, with the centre of gravity
+still above the floor. A drone hovering a few centimetres up to land is flying.
+Placement is not proposed for an aircraft standing on the very ground it would
+be placed on, whatever its nominal stance says.
+
+Every repositioning is a proposal the caller confirms (`acceptRelocation`) or
+declines (`declineRelocation`). An aircraft standing on its floor keeps that
+floor and keeps stepping while asked; any other is held with support withheld.
+Declining gives the aircraft back the floor it had (the one it stands on, or the
+last one adopted under a flying aircraft) until it climbs clear of the surface or
+the surface under its centre and every contact is no higher than that floor.
+Only an aircraft without a trusted floor, such as a placement, flies on with
+support withheld.
 
 An aircraft that flew into a hill in full view of the surface is deep below it
 too, and is deliberately left there: lifting it out would fly it through
@@ -181,8 +196,10 @@ visible surface:
   at the nose, belly, tail and wingtips. A tailstrike, a wingtip scrape or a
   gear-up landing on the plane meets JSBSim's own spring, damper and friction,
   continuously. Gear up, the SF-50 rests on its belly contacts with its
-  reference point 0.54 m above the ground and the F-35B 0.12 m, at no more than
-  1.2 in and 1.5 in of compression.
+  reference point 0.55 m above the ground and the F-35B 0.13 m, at about 0.3 in
+  and 1 in of compression. Each package's comment says where its contacts sit
+  on the drawn model. A belly contact's damping stays low enough not to chatter
+  at a 120 Hz step.
 - **Hull probes.** `visibleMeshCollision.ts` sweeps a few points per airframe
   (`*_BODY_COLLISION_PROBES` in `collisionGeometry.ts`) from one physics step to
   the next against the drawn surface: buildings, trees, and terrain off the

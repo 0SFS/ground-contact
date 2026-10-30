@@ -435,6 +435,23 @@ describe.each(["typescript", "single"] as const)("visible mesh body collision on
     expect(surface.raycast).not.toHaveBeenCalled();
   });
 
+  it("lets an acknowledged overlap exit without an underside impact, then restores collisions", () => {
+    const sdk = sdkAt();
+    const surface = surfaceWithHits([0.5]);
+    const collision = createVisibleMeshCollision(sdk as never, surface, { bodyProbes: [CENTER] });
+    collision.update();
+    collision.setTerrainOverlapIgnored(true);
+    move(sdk, { x: 10, y: 0, z: 0 });
+    expect(collision.update()).toBe(false);
+    collision.setTerrainOverlapIgnored(false);
+    expect(collision.update()).toBe(false);
+    expect(surface.raycast).not.toHaveBeenCalled();
+    expect(sdk.runIc).not.toHaveBeenCalled();
+    move(sdk, { x: 0, y: 0, z: 1 });
+    expect(collision.update()).toBe(true);
+    expect(surface.raycast).toHaveBeenCalled();
+  });
+
   it("sweeps nothing far above the surface", () => {
     const sdk = sdkAt(300 + 160);
     const surface = surfaceWithHits([0.5]);

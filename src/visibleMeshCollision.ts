@@ -86,6 +86,7 @@ export function createVisibleMeshCollision(sdk: JSBSimSdk, surface: SurfaceQuery
   });
   // Which kernel holds the previous points: null for this module's arrays.
   let previousIn: WasmHullCollision | null = null;
+  let terrainOverlapIgnored = false;
   // Set while the surface or JSBSim is called from the WASM path, whose
   // errors are the caller's, as on the reference path, not the kernel's.
   let inHost = false;
@@ -357,7 +358,17 @@ export function createVisibleMeshCollision(sdk: JSBSimSdk, surface: SurfaceQuery
 
   return {
     reset(): void { hasPrevious = false; },
+    /** A user-acknowledged world overlap; resets sweeps at both boundaries. */
+    setTerrainOverlapIgnored(ignored: boolean): void {
+      if (terrainOverlapIgnored === ignored) return;
+      terrainOverlapIgnored = ignored;
+      hasPrevious = false;
+    },
     update(): boolean {
+      // The terrain contact owner checks the full aircraft footprint before
+      // ending this episode. Do not turn an inside-to-outside crossing into
+      // an underside impact, or sweep across the ignored interval afterwards.
+      if (terrainOverlapIgnored) { hasPrevious = false; return false; }
       const kernel = slot.current;
       if (kernel) {
         const updated = updateWasm(kernel);

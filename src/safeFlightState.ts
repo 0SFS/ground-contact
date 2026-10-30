@@ -335,3 +335,27 @@ export function aircraftClearanceMeters(
     + Math.abs(Math.sin(roll) * Math.cos(pitch)) * stance.rollArmMeters
     + Math.abs(Math.cos(roll) * Math.cos(pitch)) * stance.staticMeters;
 }
+
+/** How far under its support an aircraft may start before placing it asks the pilot. */
+export const PLACEMENT_TOLERANCE_METERS = 0.001;
+/** Where JSBSim is told the ground is when it must not support the aircraft. */
+export const WITHHELD_SUPPORT_DEPTH_METERS = 10_000;
+
+/**
+ * The ground JSBSim may initialize an aircraft on. Under its support (the
+ * ground plus its clearance at this attitude) the aircraft would start on gear
+ * and structure contacts compressed by the penetration, and RunIC keeps that
+ * force in the integrators' history, so the first step would launch it. That
+ * ground is withheld instead, as the terrain contact withholds it until the
+ * pilot answers its placement question.
+ */
+export function initialTerrainElevationMeters(
+  stance: AircraftClearanceStance,
+  altitudeMeters: number,
+  groundMeters: number,
+  roll: number,
+  pitch: number,
+): number {
+  const support = groundMeters + aircraftClearanceMeters(stance, roll, pitch);
+  return altitudeMeters < support - PLACEMENT_TOLERANCE_METERS ? altitudeMeters - WITHHELD_SUPPORT_DEPTH_METERS : groundMeters;
+}

@@ -120,7 +120,16 @@ function place(sdk: Aircraft, pose: Pose): void {
 function flight(core: GroundContactCore | undefined, units: Unit[], ground: Ground, world: World) {
   const sdk = aircraft(units);
   const surface = surfaceOf(ground, world);
-  const contact = createTerrainContact(sdk as never, surface, STANCE, { core });
+  const rawContact = createTerrainContact(sdk as never, surface, STANCE, { core });
+  // These paired tests exercise support arithmetic after an explicit accepted
+  // correction. The consent/decline behavior has its own focused suite.
+  const contact = { ...rawContact, update(...args: Parameters<typeof rawContact.update>): ReturnType<typeof rawContact.update> {
+    const result = rawContact.update(...args);
+    const proposal = rawContact.getRelocationProposal();
+    if (!proposal) return result;
+    expect(rawContact.acceptRelocation(proposal.id)).toBe(true);
+    return "reset";
+  } };
   return { sdk, surface, contact };
 }
 

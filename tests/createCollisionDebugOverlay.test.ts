@@ -1,7 +1,7 @@
 import { NullEngine, Quaternion, Scene, TransformNode, Vector3 } from "@babylonjs/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { C172_BODY_COLLISION_PROBES, C172_GROUND_CONTACTS, groundContactBodyPosition } from "../src/collisionGeometry";
-import { createCollisionDebugOverlay } from "../src/createCollisionDebugOverlay";
+import { collisionMarkerDiameter, createCollisionDebugOverlay } from "../src/createCollisionDebugOverlay";
 
 const INCHES_PER_METER = 1 / 0.0254;
 
@@ -124,5 +124,37 @@ describe("collision debug overlay", () => {
     overlay.update();
     expect(scene.getMeshByName("collision-debug/body/nose")?.isVisible).toBe(true);
     overlay.dispose();
+  });
+
+  it("tells what it shows and sizes its markers to the aircraft", () => {
+    const scene = createScene();
+    const { sdk } = createSdk();
+    const plane = createCollisionDebugOverlay(scene, new TransformNode("plane", scene), sdk as never, C172_BODY_COLLISION_PROBES);
+    expect(plane.legend()).toBeNull();
+    plane.setEnabled(true);
+    expect(plane.legend()).toEqual({ bodyProbes: C172_BODY_COLLISION_PROBES.length,
+      wheels: C172_GROUND_CONTACTS.filter(contact => contact.kind === "wheel").length,
+      structures: C172_GROUND_CONTACTS.filter(contact => contact.kind === "structure").length });
+    expect(scene.getMeshByName("collision-debug/wheel/gear/unit")?.scaling.x).toBe(0.24);
+    plane.dispose();
+
+    // A small drone's four feet, about twelve centimetres from its CG, as JSBSim STRUCTURE units.
+    const feet = [[-2.76, -3.76, -1.57], [-2.76, 3.76, -1.57], [1.55, -0.62, -1.21], [1.55, 0.62, -1.21]];
+    const values: Record<string, number> = { "inertia/cg-x-in": -0.087, "inertia/cg-y-in": 0, "inertia/cg-z-in": -0.197, "gear/num-units": 4 };
+    const catalog: string[] = [];
+    feet.forEach(([x, y, z], unit) => {
+      const prefix = `contact/unit[${unit}]/`;
+      Object.assign(values, { [`${prefix}x-position`]: x, [`${prefix}y-position`]: y, [`${prefix}z-position`]: z });
+      catalog.push(`${prefix}x-position (RW)`);
+    });
+    const drone = createCollisionDebugOverlay(scene, new TransformNode("drone", scene),
+      { getPropertyValue: (property: string) => values[property], queryPropertyCatalog: () => catalog.join("\n") } as never, []);
+    drone.setEnabled(true);
+    expect(drone.legend()).toEqual({ bodyProbes: 0, wheels: 0, structures: 4 });
+    const foot = scene.getMeshByName("collision-debug/structure/contact/unit[0]")!;
+    expect(foot.scaling.x).toBeCloseTo(collisionMarkerDiameter(foot.position.length()), 12);
+    expect(foot.scaling.x).toBeLessThan(0.015);
+    expect(scene.getMeshByName("collision-debug/cg/center-of-gravity")?.scaling.x).toBeCloseTo(foot.scaling.x * 0.75, 12);
+    drone.dispose();
   });
 });

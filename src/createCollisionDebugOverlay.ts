@@ -11,6 +11,18 @@ const COLORS: Record<MarkerKind, string> = {
   body: "#39dfff", wheel: "#ffbb46", structure: "#cc82ff", cg: "#ffffff",
 };
 
+/** How many points of each kind the overlay shows. */
+export interface CollisionDebugLegend { bodyProbes: number; wheels: number; structures: number }
+
+/**
+ * Marker diameter in metres for an aircraft whose farthest shown point is
+ * `reachM` from its CG: a dot beside a drone's foot, at most a quarter metre
+ * on an airliner.
+ */
+export function collisionMarkerDiameter(reachM: number): number {
+  return Math.min(0.24, Math.max(0.01, reachM * 0.08));
+}
+
 /** Shows the actual point contacts, not an invented solid collision hull:
  * the points the hull probes sweep, and the loaded model's JSBSim contacts.
  * Local coordinates are aircraft left/up/forward in metres, centred on its CG.
@@ -25,6 +37,8 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
   const materials: StandardMaterial[] = [];
   const bodyMarkers: Mesh[] = [];
   const groundMarkers: Mesh[] = [];
+  let cgMarker: Mesh | null = null;
+  let legend: CollisionDebugLegend | null = null;
   // Each contact's x, y and z position properties, three per contact.
   let contactPaths: string[] = [];
   let guidePositions = new Float32Array(0);
@@ -57,8 +71,8 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
     }
 
     function marker(kind: MarkerKind, name: string): Mesh {
-      const mesh = CreateSphere(`collision-debug/${kind}/${name}`,
-        { diameter: kind === "cg" ? 0.18 : 0.24, segments: 4 }, scene);
+      // A unit sphere, sized to the aircraft once its points are placed.
+      const mesh = CreateSphere(`collision-debug/${kind}/${name}`, { diameter: 1, segments: 4 }, scene);
       mesh.parent = root;
       mesh.material = palette[kind];
       mesh.isPickable = false;
@@ -71,7 +85,7 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       return mesh;
     }
 
-    marker("cg", "center-of-gravity");
+    cgMarker = marker("cg", "center-of-gravity");
     // Both kinds follow the CG, so they stay hidden until update() reads one.
     for (const probe of probes) {
       const mesh = marker("body", probe.name);
@@ -85,6 +99,9 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       groundMarkers.push(mesh);
     }
     const markers = [...bodyMarkers, ...groundMarkers];
+    legend = { bodyProbes: bodyMarkers.length, wheels: groundMarkers.filter(mesh => mesh.metadata.collisionDebug.kind === "wheel").length,
+      structures: groundMarkers.filter(mesh => mesh.metadata.collisionDebug.kind === "structure").length };
+    resize(0);
     guidePositions = new Float32Array(markers.length * 6);
     guides = CreateLineSystem("collision-debug/guides", {
       lines: markers.map(mesh => [Vector3.Zero(), mesh.position]), updatable: true,
@@ -113,6 +130,14 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
     mesh.position.toArray(guidePositions, line * 6 + 3);
   }
 
+  /** Sizes every marker to an aircraft reaching `reachM` from its CG. */
+  function resize(reachM: number): void {
+    const diameter = collisionMarkerDiameter(reachM);
+    cgMarker?.scaling.setAll(diameter * 0.75);
+    for (const mesh of bodyMarkers) mesh.scaling.setAll(diameter);
+    for (const mesh of groundMarkers) mesh.scaling.setAll(diameter);
+  }
+
   function update(): void {
     if (!enabled || disposed || !guides) return;
     const xIn = sdk.getPropertyValue("inertia/cg-x-in");
@@ -137,6 +162,10 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       const known = valid && Number.isFinite(contact.xIn) && Number.isFinite(contact.yIn) && Number.isFinite(contact.zIn);
       place(groundMarkers[index], known, offset.left, offset.up, offset.forward, bodyMarkers.length + index);
     }
+    let reachM = 0;
+    for (const mesh of bodyMarkers) if (mesh.isVisible) reachM = Math.max(reachM, mesh.position.length());
+    for (const mesh of groundMarkers) if (mesh.isVisible) reachM = Math.max(reachM, mesh.position.length());
+    resize(reachM);
     guides.updateVerticesData(VertexBuffer.PositionKind, guidePositions);
   }
 
@@ -149,6 +178,10 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       if (enabled) update();
     },
     update,
+    /** What the overlay shows, once it has been enabled. */
+    legend(): CollisionDebugLegend | null {
+      return legend;
+    },
     dispose(): void {
       if (disposed) return;
       disposed = true;
@@ -157,6 +190,8 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       for (const material of materials) material.dispose();
       root = null;
       guides = null;
+      cgMarker = null;
+      legend = null;
     },
   };
 }

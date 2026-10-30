@@ -659,7 +659,17 @@ export function createTerrainContact(
   surface: SurfaceQuery,
   clearanceProfile: AircraftClearanceStance,
   /** A WASM ground-contact core, or its load, for the contact support plane. */
-  options: { core?: GroundContactCoreSource; bodyProbes?: readonly BodyCollisionProbe[] } = {},
+  options: {
+    core?: GroundContactCoreSource;
+    bodyProbes?: readonly BodyCollisionProbe[];
+    /**
+     * Corrections no larger than this, in metres, are made without asking:
+     * the aircraft is moved onto the ground and `update` returns "reset".
+     * Larger ones become proposals. Read on every correction; absent asks
+     * about all of them.
+     */
+    automaticMoveMeters?: () => number;
+  } = {},
 ) {
   // `height` is the raw sample under the centre, used to detect the world
   // changing. `ground` is the support plane the contacts ride on and JSBSim is
@@ -771,6 +781,34 @@ export function createTerrainContact(
   const overlapGone = (lat: number, lon: number, ground: number, floor: number): boolean =>
     ground <= floor + PLACEMENT_TOLERANCE_METERS
     && everyPoint(lat, lon, (point, surfaceMeters, contact) => contact ? surfaceMeters <= floor + PLACEMENT_TOLERANCE_METERS : point >= surfaceMeters);
+  /** Moves the aircraft as `accepted` proposed and adopts the contact measured for it. */
+  const applyRelocation = (accepted: TerrainRelocationProposal): void => {
+    if (accepted.reason === "surface refinement") {
+      // Only the position moves, by the change itself: velocities, rates,
+      // the oleo state and the integrators' history carry on, so nothing
+      // drops onto its springs. An aircraft that stood on its floor kept
+      // flying while it was asked, so it moves from where it is now.
+      sdk.setPropertyValue("position/terrain-elevation-asl-ft", accepted.groundHeightMeters / 0.3048);
+      sdk.setPropertyValue("position/h-sl-ft", sdk.getPropertyValue("position/h-sl-ft") + accepted.deltaMeters / 0.3048);
+    } else {
+      const snapshot = captureSimulation(sdk);
+      snapshot.initial["ic/terrain-elevation-ft"] = accepted.groundHeightMeters / 0.3048;
+      snapshot.initial["ic/h-sl-ft"] = accepted.altitudeMeters / 0.3048;
+      // Preserve lateral motion; remove only downward velocity into the plane.
+      snapshot.initial["ic/vd-fps"] = Math.min(0, snapshot.initial["ic/vd-fps"]);
+      restoreSimulation(sdk, snapshot);
+    }
+    proposal = null;
+    ignoreOverlap = false;
+    keptFloor = null;
+    holding = false;
+    previous = proposedContact;
+    proposedContact = null;
+    blockReason = null;
+    // A refinement proposal can preserve suspension compression; accepting
+    // it must not immediately create a second nominal-stance proposal.
+    placement = false;
+  };
   /** Fly on without a relocation, on the floor kept for it or, without one, with support withheld. */
   const stayHere = (floor: number | null): void => {
     proposal = null;
@@ -782,45 +820,28 @@ export function createTerrainContact(
     if (floor === null) withholdSupport();
     else setFloor(floor);
   };
+  /** Judge the ground afresh, with no question, waiver or kept floor left over. */
+  const reset = (): void => {
+    clearContactHistory();
+    proposal = null;
+    proposedContact = null;
+    ignoreOverlap = false;
+    keptFloor = null;
+    holding = false;
+  };
+  /** The state a hard impact stopped the aircraft in, with its fall stopped: that fall was the impact. */
+  const impactSnapshot = () => {
+    const snapshot = captureSimulation(sdk);
+    snapshot.initial["ic/vd-fps"] = Math.min(0, snapshot.initial["ic/vd-fps"]!);
+    return snapshot;
+  };
   return {
-    reset() {
-      clearContactHistory();
-      proposal = null;
-      proposedContact = null;
-      ignoreOverlap = false;
-      keptFloor = null;
-      holding = false;
-    },
+    reset,
     getRelocationProposal: (): TerrainRelocationProposal | null => proposal,
     /** Only call after confirmation of this exact proposal. */
     acceptRelocation(id: number): boolean {
       if (!proposal || proposal.id !== id) return false;
-      const accepted = proposal;
-      if (accepted.reason === "surface refinement") {
-        // Only the position moves, by the change itself: velocities, rates,
-        // the oleo state and the integrators' history carry on, so nothing
-        // drops onto its springs. An aircraft that stood on its floor kept
-        // flying while it was asked, so it moves from where it is now.
-        sdk.setPropertyValue("position/terrain-elevation-asl-ft", accepted.groundHeightMeters / 0.3048);
-        sdk.setPropertyValue("position/h-sl-ft", sdk.getPropertyValue("position/h-sl-ft") + accepted.deltaMeters / 0.3048);
-      } else {
-        const snapshot = captureSimulation(sdk);
-        snapshot.initial["ic/terrain-elevation-ft"] = accepted.groundHeightMeters / 0.3048;
-        snapshot.initial["ic/h-sl-ft"] = accepted.altitudeMeters / 0.3048;
-        // Preserve lateral motion; remove only downward velocity into the plane.
-        snapshot.initial["ic/vd-fps"] = Math.min(0, snapshot.initial["ic/vd-fps"]);
-        restoreSimulation(sdk, snapshot);
-      }
-      proposal = null;
-      ignoreOverlap = false;
-      keptFloor = null;
-      holding = false;
-      previous = proposedContact;
-      proposedContact = null;
-      blockReason = null;
-      // A refinement proposal can preserve suspension compression; accepting
-      // it must not immediately create a second nominal-stance proposal.
-      placement = false;
+      applyRelocation(proposal);
       return true;
     },
     /** Stay put. An aircraft keeps the floor it had, so one standing on the ground stays on it. */
@@ -837,6 +858,40 @@ export function createTerrainContact(
       const standing = standsOn(floor, sdk.getPropertyValue("position/h-sl-ft") * 0.3048, roll, pitch,
         aircraftClearanceMeters(clearanceProfile, roll, pitch));
       stayHere(standing ? floor : null);
+    },
+    /**
+     * Fly on from where a hard impact stopped the aircraft inside the surface,
+     * with its fall stopped. The floor is held under its lowest contact until
+     * it is clear of the surface, so it starts on the floor rather than in it.
+     * Returns the floor, in metres.
+     */
+    flyOnFromImpact(): number {
+      const altitude = sdk.getPropertyValue("position/h-sl-ft") * 0.3048;
+      const roll = sdk.getPropertyValue("attitude/phi-deg") * Math.PI / 180;
+      const pitch = sdk.getPropertyValue("attitude/theta-deg") * Math.PI / 180;
+      const floor = altitude - lowestContactMeters(roll, pitch, aircraftClearanceMeters(clearanceProfile, roll, pitch));
+      const snapshot = impactSnapshot();
+      snapshot.initial["ic/terrain-elevation-ft"] = floor / 0.3048;
+      restoreSimulation(sdk, snapshot);
+      stayHere(floor);
+      return floor;
+    },
+    /**
+     * Lift the aircraft `meters` straight up from where a hard impact stopped
+     * it, with its fall stopped. The ground measured under it is still the
+     * ground under it, so this is no new placement: a banked aircraft that
+     * its stance would put higher is not asked about the ground again.
+     */
+    liftFromImpact(meters: number): void {
+      const snapshot = impactSnapshot();
+      snapshot.initial["ic/h-sl-ft"] = snapshot.initial["ic/h-sl-ft"]! + meters / 0.3048;
+      restoreSimulation(sdk, snapshot);
+      proposal = null;
+      proposedContact = null;
+      holding = false;
+      ignoreOverlap = false;
+      keptFloor = null;
+      blockReason = null;
     },
     isTerrainIgnored: (): boolean => ignoreOverlap,
     getBlockReason: (): TerrainBlockReason => blockReason,
@@ -1068,6 +1123,16 @@ export function createTerrainContact(
         };
         proposedContact = { lat, lon, height: hit.heightMeters, ground, revision: hit.revision,
           clearance: target - ground - clearance };
+        // A small correction is made at once: the aircraft floats onto the
+        // ground instead of stopping to ask about centimetres.
+        const automatic = options.automaticMoveMeters?.() ?? 0;
+        if (Math.abs(target - altitude) <= automatic) {
+          flightLog.info("terrain", "Moved onto the ground without asking", {
+            reason: proposal.reason, deltaMeters: Number((target - altitude).toFixed(3)), limitMeters: automatic,
+          });
+          applyRelocation(proposal);
+          return "reset";
+        }
         // An aircraft standing on its floor keeps it and keeps flying while
         // asked: holding it would freeze it, and withholding its floor would
         // drop it. Any other is held; its floor is given back if the pilot

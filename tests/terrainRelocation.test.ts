@@ -7,7 +7,7 @@ import { createTerrainContact } from "../src/terrainContact";
  * gravity, as a drone's legs are; without it the model reports no contacts and
  * its stance stands in for them.
  */
-function fixture(altitude = 50, options: { contactMeters?: number; staticMeters?: number } = {}) {
+function fixture(altitude = 50, options: { contactMeters?: number; staticMeters?: number; automaticMoveMeters?: number | (() => number) } = {}) {
   const values: Record<string, number> = {
     "position/lat-geod-deg": 34, "position/long-gc-deg": -118,
     "position/h-sl-ft": altitude / 0.3048,
@@ -35,8 +35,10 @@ function fixture(altitude = 50, options: { contactMeters?: number; staticMeters?
     raycast: () => null,
     sample: () => height === null ? null : ({ heightMeters: height, revision } as SurfaceHit),
   };
+  const automatic = options.automaticMoveMeters;
   const contact = createTerrainContact(sdk as never, surface,
-    { staticMeters: options.staticMeters ?? 1, staticPitchRad: 0, pitchArmMeters: 0, rollArmMeters: 0 });
+    { staticMeters: options.staticMeters ?? 1, staticPitchRad: 0, pitchArmMeters: 0, rollArmMeters: 0 },
+    automatic === undefined ? {} : { automaticMoveMeters: typeof automatic === "function" ? automatic : () => automatic });
   return {
     sdk, values, contact, surface,
     setHeight(next: number | null) { height = next; revision++; },
@@ -196,6 +198,54 @@ describe("consent for terrain relocation", () => {
     expect(floor()).toBeCloseTo(100);
   });
 
+  it("flies on from a hard impact on a floor under its lowest contact, without its fall, until it is clear", () => {
+    const { sdk, values, contact, setHeight, floor, altitude } = fixture(101.5, { contactMeters: 1.5 });
+    expect(contact.update()).toBe(true);
+    expect(floor()).toBeCloseTo(100);
+    // Stopped falling 0.6 m into the surface, as the step loop's impact guard leaves it.
+    values["position/h-sl-ft"] = 100.9 / 0.3048;
+    values["velocities/v-down-fps"] = 20;
+    values["velocities/v-north-fps"] = 90;
+    expect(contact.flyOnFromImpact()).toBeCloseTo(99.4);
+    expect(sdk.runIc).toHaveBeenCalled();
+    expect(values["ic/vd-fps"]).toBe(0);
+    expect(values["ic/vn-fps"]).toBe(90);
+    expect(altitude()).toBeCloseTo(100.9);
+    expect(floor()).toBeCloseTo(99.4);
+    expect(contact.isTerrainIgnored()).toBe(true);
+    // Still inside: the floor stays under the contact, wherever the surface is.
+    for (const height of [100, 100.4, null]) {
+      setHeight(height);
+      expect(contact.update()).toBe(true);
+      expect(contact.getRelocationProposal()).toBeNull();
+      expect(floor()).toBeCloseTo(99.4);
+    }
+    // The surface no higher than that floor: the surface carries it again.
+    setHeight(99.3);
+    expect(contact.update()).toBe(true);
+    expect(contact.isTerrainIgnored()).toBe(false);
+    expect(floor()).toBeCloseTo(99.3);
+  });
+
+  it("lifts an aircraft out of a hard impact without its fall, and does not ask about the ground it measured", () => {
+    // A stance of 3 m, as a banked aircraft's is, would call 1.6 m up a misplacement.
+    const { sdk, values, contact, floor, altitude } = fixture(110, { contactMeters: 1.5, staticMeters: 3 });
+    expect(contact.update()).toBe(true);
+    values["position/h-sl-ft"] = 100.9 / 0.3048;
+    values["velocities/v-down-fps"] = 20;
+    values["velocities/v-north-fps"] = 90;
+    contact.liftFromImpact(0.7);
+    expect(sdk.runIc).toHaveBeenCalled();
+    expect(values["ic/vd-fps"]).toBe(0);
+    expect(values["ic/vn-fps"]).toBe(90);
+    expect(altitude()).toBeCloseTo(101.6);
+    expect(floor()).toBeCloseTo(100);
+    expect(contact.isTerrainIgnored()).toBe(false);
+    expect(contact.update()).toBe(true);
+    expect(contact.getRelocationProposal()).toBeNull();
+    expect(floor()).toBeCloseTo(100);
+  });
+
   it("accepts a refinement by moving only the height, so the gear keeps its compression", () => {
     const { sdk, values, contact, setHeight } = fixture(101);
     contact.update();
@@ -207,6 +257,70 @@ describe("consent for terrain relocation", () => {
     expect(sdk.resetToInitialConditions).not.toHaveBeenCalled();
     expect(sdk.runIc).not.toHaveBeenCalled();
     expect(contact.update()).toBe(true);
+    expect(contact.getRelocationProposal()).toBeNull();
+  });
+});
+
+describe("small terrain corrections made without asking", () => {
+  it("moves a standing aircraft with a centimetre refinement, keeping its gear compression", () => {
+    const { sdk, contact, setHeight, floor, altitude } = fixture(101, { automaticMoveMeters: 1 });
+    expect(contact.update()).toBe(true);
+    setHeight(100.01);
+    expect(contact.update()).toBe("reset");
+    expect(contact.getRelocationProposal()).toBeNull();
+    expect(contact.getBlockReason()).toBeNull();
+    expect(altitude()).toBeCloseTo(101.01);
+    expect(floor()).toBeCloseTo(100.01);
+    expect(sdk.runIc).not.toHaveBeenCalled();
+    // Settled: the next step neither asks nor moves it again.
+    expect(contact.update()).toBe(true);
+    expect(contact.getRelocationProposal()).toBeNull();
+    expect(altitude()).toBeCloseTo(101.01);
+  });
+
+  it("lowers a standing aircraft with ground that refined down within the limit", () => {
+    const { contact, setHeight, floor, altitude } = fixture(101, { automaticMoveMeters: 1 });
+    contact.update();
+    setHeight(99.7);
+    expect(contact.update()).toBe("reset");
+    expect(contact.getRelocationProposal()).toBeNull();
+    expect(altitude()).toBeCloseTo(100.7);
+    expect(floor()).toBeCloseTo(99.7);
+  });
+
+  it("floats an aircraft placed less than the limit underground up onto the ground", () => {
+    const { sdk, contact, floor, altitude } = fixture(100.4, { automaticMoveMeters: 1 });
+    expect(contact.update()).toBe("reset");
+    expect(contact.getRelocationProposal()).toBeNull();
+    expect(sdk.runIc).toHaveBeenCalled();
+    expect(altitude()).toBeCloseTo(101);
+    expect(floor()).toBeCloseTo(100);
+    expect(contact.update()).toBe(true);
+    expect(contact.getRelocationProposal()).toBeNull();
+  });
+
+  it("still asks about a correction deeper than the limit", () => {
+    const { sdk, contact, setHeight } = fixture(101, { automaticMoveMeters: 1 });
+    contact.update();
+    setHeight(101.5);
+    expect(contact.update()).toBe(true);
+    expect(contact.getRelocationProposal()).toMatchObject({ reason: "surface refinement", deltaMeters: 1.5 });
+    const placed = fixture(98, { automaticMoveMeters: 1 });
+    expect(placed.contact.update()).toBe(false);
+    expect(placed.contact.getRelocationProposal()).toMatchObject({ reason: "placement", altitudeMeters: 101 });
+    expect(sdk.runIc).not.toHaveBeenCalled();
+    expect(placed.sdk.runIc).not.toHaveBeenCalled();
+  });
+
+  it("reads the limit on every correction, so a change applies live", () => {
+    let limit = 0;
+    const { contact } = fixture(100.98, { automaticMoveMeters: () => limit });
+    // Placed 2 cm under its stance: asked while the limit is 0, moved once it is 5 cm.
+    expect(contact.update()).toBe(false);
+    expect(contact.getRelocationProposal()).toMatchObject({ reason: "placement" });
+    contact.reset();
+    limit = 0.05;
+    expect(contact.update()).toBe("reset");
     expect(contact.getRelocationProposal()).toBeNull();
   });
 });

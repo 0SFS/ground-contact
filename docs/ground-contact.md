@@ -42,6 +42,16 @@ the settled stance leaves the gear extended; the aircraft sinks back onto its
 springs; the next placement lifts it again. It reads as sinking into quicksand
 and being teleported out.
 
+A contact is a spring, and it rests pressed into the floor by its share of the
+weight. Contacts stiff enough to hide that are not steady at the physics rate on
+a drone of a few hundred grams, so the DJI drones' feet sit below the drawn feet
+by that compression instead: 2.1 cm at the front and 1.8 cm at the back on the
+Air 2S, 1.2 and 0.7 cm on the Mini 2 (their `dji-*.xml`). Once settled, the
+drawn feet stand on the ground. The collision view (Debug → Collision geometry)
+draws each contact where the physics has it, with markers sized to the aircraft
+and a count of each kind, so a resting contact shows a little below its foot or
+wheel.
+
 ## The gear model, and what it does not include
 
 JSBSim's contacts are not naive point collisions. Measured from a rolling
@@ -175,7 +185,14 @@ Placement is not proposed for an aircraft standing on the very ground it would
 be placed on, whatever its nominal stance says.
 
 Every repositioning is a proposal the caller confirms (`acceptRelocation`) or
-declines (`declineRelocation`). An aircraft standing on its floor keeps that
+declines (`declineRelocation`), unless it is small: a move of
+`automaticMoveMeters` or less, up or down (fly's
+`osfs.ground.automaticMoveMeters`, 1 m by default, 0 always asks), is applied at
+once as an accepted one would be, and logged as `Moved onto the ground without
+asking`. That limit is measured against the surface seen from above, so a
+contact less than that under a bridge deck is lifted onto the deck
+([underground and bridges](proposals/underground-and-bridges/README.md)).
+An aircraft standing on its floor keeps that
 floor and keeps stepping while asked; any other is held with support withheld.
 Declining gives the aircraft back the floor it had (the one it stands on, or the
 last one adopted under a flying aircraft) until it climbs clear of the surface or
@@ -186,6 +203,30 @@ support withheld.
 An aircraft that flew into a hill in full view of the surface is deep below it
 too, and is deliberately left there: lifting it out would fly it through
 terrain. That case ends in a physics fault, which is the intended outcome.
+
+## After a hard impact
+
+fly's step loop stops an aircraft whose lowest contact, by its attitude, is more
+than 0.5 m under JSBSim's floor (`groundContactClearanceMeters`;
+`lowestGroundContact` also names the contact). Clearing the fault alone does not
+help: the aircraft is still that deep, and the next step stops on the same
+impact. That was the Resume loop a pilot hit after stalling an F-35B into trees.
+Terrain contact offers two ways on, and both stop the fall, which was the
+impact, keeping the speed along the ground:
+
+- `flyOnFromImpact()` keeps the aircraft where it stopped, on a floor held under
+  its lowest contact (`stayHere`), until it is clear of the surface. It returns
+  that floor.
+- `liftFromImpact(meters)` lifts it straight up and keeps the ground it
+  measured. It does not reset the contact history, since a reset means a new
+  placement, and the stance clearance of a banked or pitched aircraft can be
+  metres more than its lowest contact needs. A reset would call the lifted
+  aircraft misplaced, withhold its support and hold it frozen in the air.
+
+fly's bottom card offers these as Resume and Move up by the depth and 10 cm.
+`hardImpact.integration.test.ts` in fly replays that F-35B crash in real JSBSim
+from the pilot's bug report. It fails if the aircraft stops on the same impact,
+is held, or does not settle onto the trees.
 
 ## Hull collision
 
@@ -234,7 +275,10 @@ A fault carries the contact state read *before* the restore rewinds it:
 the terrain elevation the gear was given, height above it before and after the
 step, and per-gear compression. The line that separates a gear-spring launch
 from an aerodynamic divergence also appears on the centre-screen notice, because
-that is the part someone reporting a problem can actually see.
+that is the part someone reporting a problem can actually see. A hard ground
+impact is asked about on the bottom card instead (above), and the bug report's
+flight state names the fault, how many there were this visit, the last impact's
+depth, floor and contact, and what the card shows.
 
 Useful log entries when the ground behaves oddly:
 
@@ -244,3 +288,7 @@ Useful log entries when the ground behaves oddly:
 - `Repositioned onto the surface (…)` — which of the two causes fired.
 - `Moved with a surface refinement` — a refinement of more than a metre moved
   the aircraft with it.
+- `Moved onto the ground without asking` — a move within `automaticMoveMeters`.
+- `Stopped a deep ground impact before loading the gear springs` (fly), with the
+  contact that went deepest, then `Flying on from a hard impact` or
+  `Moved up out of a hard impact`.

@@ -82,7 +82,7 @@ export const GROUND_CHOICE_LABELS: { [K in GroundLockableKey]: Record<GroundInte
 /** Finite wheel inertia by default; aircraft ground forces remain with JSBSim. */
 export const DEFAULT_GROUND_INTERACTION_SETTINGS: Readonly<GroundInteractionSettingsV1> = Object.freeze({
   version: 1, selection: "manual", rotation: "inertia", forceModel: "jsbsim", contactModel: "shared", backend: "auto",
-  tireAudio: "off", haptics: "off", wheelVisuals: "off", tireAudioVolume: 0.7, hapticStrength: 0.6, locked: {},
+  tireAudio: "off", haptics: "landing", wheelVisuals: "off", tireAudioVolume: 0.7, hapticStrength: 0.6, locked: {},
 });
 
 function isChoice<K extends GroundLockableKey>(key: K, value: unknown): value is GroundInteractionSettingsV1[K] {

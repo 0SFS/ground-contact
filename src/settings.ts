@@ -99,7 +99,9 @@ function groundChoice<Key extends GroundLockableKey>(key: Key, description: stri
     default: DEFAULT_GROUND_INTERACTION_SETTINGS[key] as string,
     defaultReason: key === "rotation"
       ? "Retain wheel angular velocity through liftoff and model gradual spin-up."
-      : "Keep JSBSim ground forces and shared terrain; additional feedback stays opt-in.",
+      : key === "haptics"
+        ? "Landing cues on supported controllers and paired phones; unavailable devices stay silent."
+        : "Keep JSBSim ground forces and shared terrain; tire audio stays opt-in.",
     home: all(GROUND),
     appliesLive: true,
     source: "ground-contact/src/groundInteractionSettings.ts",

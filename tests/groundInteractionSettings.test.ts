@@ -25,7 +25,7 @@ describe("settings migration", () => {
   it("defaults to finite wheel inertia with JSBSim/shared terrain on CPU", () => {
     const store = createGroundSettingsStore(groundContactParameterDefaults());
     expect(store.settings).toMatchObject({ version: 1, selection: "manual", rotation: "inertia",
-      forceModel: "jsbsim", contactModel: "shared", backend: "auto", tireAudio: "off", haptics: "off", wheelVisuals: "off" });
+      forceModel: "jsbsim", contactModel: "shared", backend: "auto", tireAudio: "off", haptics: "landing", wheelVisuals: "off" });
     expect(resolveGroundInteraction(store.settings, CAPABILITIES).active).toMatchObject({ rotation: "inertia", backend: "cpu-js" });
   });
 
@@ -35,7 +35,7 @@ describe("settings migration", () => {
     }))!);
     const store = createGroundSettingsStore(parameters);
     expect(store.settings).toMatchObject({ version: 1, rotation: "inertia", tireAudio: "slip", tireAudioVolume: 1,
-      haptics: "off", selection: "manual", forceModel: "jsbsim", locked: { rotation: true } });
+      haptics: "landing", selection: "manual", forceModel: "jsbsim", locked: { rotation: true } });
     expect(store.settings.locked).not.toHaveProperty("bogus");
     expect(parameters.get("osfs.ground.lock.rotation")).toBe(true);
   });

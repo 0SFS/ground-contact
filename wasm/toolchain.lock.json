@@ -13,5 +13,5 @@
   "maximumMemoryBytes": 33554432,
   "maximumBinaryBytes": 262144,
   "wasmBindgen": null,
-  "qualification": "coupled wheels, wheel spin and the wheel ground filter identical bit for bit to the TypeScript (scripts/check.mjs); probes within ulps of the TypeScript geometry; hull impulses checked for momentum, angular momentum, Coulomb bounds and energy; zero heap allocations while stepping; browser, performance and power qualification are separate"
+  "qualification": "coupled wheels, wheel spin and sampled contact support identical bit for bit to the TypeScript (scripts/check.mjs); probes within ulps of the TypeScript geometry; hull impulses checked for momentum, angular momentum, Coulomb bounds and energy; zero heap allocations while stepping; browser, performance and power qualification are separate"
 }

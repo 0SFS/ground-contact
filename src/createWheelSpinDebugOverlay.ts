@@ -1,9 +1,29 @@
 import type { JSBSimSdk } from "@felipegalind0/jsbsim";
-import { Color3, Constants, CreateLineSystem, TransformNode, Vector3, type Scene } from "@babylonjs/core";
+import { AbstractMesh, Color3, Constants, CreateLineSystem, TransformNode, Vector3, VertexBuffer, type LinesMesh, type Material, type Scene } from "@babylonjs/core";
 import { C172_GROUND_CONTACTS, groundContactBodyPosition } from "./collisionGeometry";
 import { WHEEL_SPIN_CONFIGS, type WheelSpinState } from "./wheelSpin";
 
-/** Tire outlines illustrate the scalar spin experiment, not a new collision hull.
+/** Shared drawing style; each outline owns its line material. */
+function createTireOutline(scene: Scene, parent: TransformNode, name: string, lines: Vector3[][]): LinesMesh {
+  const mesh = CreateLineSystem(`wheel-spin-debug/${name}/tire`, { lines }, scene);
+  mesh.parent = parent;
+  mesh.color = Color3.FromHexString("#ffbb46");
+  mesh.alpha = 0.95;
+  mesh.alphaIndex = 10002;
+  mesh.isPickable = false;
+  mesh.doNotSerialize = true;
+  mesh.alwaysSelectAsActiveMesh = true;
+  mesh.metadata = { collisionDebug: { kind: "wheel-spin", name } };
+  if (mesh.material) {
+    mesh.material.depthFunction = Constants.ALWAYS;
+    mesh.material.disableDepthWrite = true;
+  }
+  return mesh;
+}
+
+/** C172-only illustration for the standalone wheel-feedback benchmark.
+ * Not used by the app's Collision geometry view: these outlines are not collision
+ * shapes and their hardcoded C172 coordinates are invalid for other aircraft.
  * Axles use the uncompressed contact references plus radius and vertical stroke.
  * Sloped ground/strut flex are intentionally not reconstructed here.
  */
@@ -36,19 +56,7 @@ export function createWheelSpinDebugOverlay(scene: Scene, parent: TransformNode,
         lines.push(ring, [new Vector3(x, 0, 0), ring[0]]);
       }
       lines.push([new Vector3(-config.widthMeters / 2, 0, 0), new Vector3(config.widthMeters / 2, 0, 0)]);
-      const mesh = CreateLineSystem(`wheel-spin-debug/${config.name}/tire`, { lines }, scene);
-      mesh.parent = rotor;
-      mesh.color = Color3.FromHexString("#ffbb46");
-      mesh.alpha = 0.95;
-      mesh.alphaIndex = 10002;
-      mesh.isPickable = false;
-      mesh.doNotSerialize = true;
-      mesh.alwaysSelectAsActiveMesh = true;
-      mesh.metadata = { collisionDebug: { kind: "wheel-spin", name: config.name } };
-      if (mesh.material) {
-        mesh.material.depthFunction = Constants.ALWAYS;
-        mesh.material.disableDepthWrite = true;
-      }
+      createTireOutline(scene, rotor, config.name, lines);
     }
   }
 
@@ -85,6 +93,131 @@ export function createWheelSpinDebugOverlay(scene: Scene, parent: TransformNode,
       disposed = true;
       root?.dispose(false, true);
       root = null;
+    },
+  };
+}
+
+/** The portion of an aircraft rig's rolling wheel needed by its debug drawing. */
+export interface AircraftWheelDebugSource {
+  readonly node: TransformNode;
+}
+
+/** A tire's enclosing cylinder about the wheel's local X axis, in mesh units. */
+export interface TireOutline {
+  readonly centerY: number;
+  readonly centerZ: number;
+  readonly radius: number;
+  readonly minX: number;
+  readonly maxX: number;
+}
+
+/** Vertices nearer the axle than this fraction of the outer radius are hub. */
+const TIRE_BAND = 0.5;
+
+/**
+ * Measure the tire from the wheel mesh's own vertices: its outer radius about
+ * the axle and the side faces of the tire band. A wheel mesh can include a hub
+ * or axle stub that reaches far past one sidewall (AF267's F-35B wheels do),
+ * so the mesh's bounding box would put one ring beside the tire. Null without
+ * readable vertices, rather than an outline guessed from the bounds.
+ */
+export function measureTireOutline(mesh: AbstractMesh): TireOutline | null {
+  const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
+  if (!positions || positions.length < 3) return null;
+  let minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (let at = 0; at < positions.length; at += 3) {
+    minY = Math.min(minY, positions[at + 1]); maxY = Math.max(maxY, positions[at + 1]);
+    minZ = Math.min(minZ, positions[at + 2]); maxZ = Math.max(maxZ, positions[at + 2]);
+  }
+  const centerY = (minY + maxY) / 2, centerZ = (minZ + maxZ) / 2;
+  let radiusSquared = 0;
+  for (let at = 0; at < positions.length; at += 3) {
+    const y = positions[at + 1] - centerY, z = positions[at + 2] - centerZ;
+    radiusSquared = Math.max(radiusSquared, y * y + z * z);
+  }
+  const bandSquared = radiusSquared * TIRE_BAND * TIRE_BAND;
+  let minX = Infinity, maxX = -Infinity;
+  for (let at = 0; at < positions.length; at += 3) {
+    const y = positions[at + 1] - centerY, z = positions[at + 2] - centerZ;
+    if (y * y + z * z < bandSquared) continue;
+    minX = Math.min(minX, positions[at]); maxX = Math.max(maxX, positions[at]);
+  }
+  const radius = Math.sqrt(radiusSquared);
+  return [centerY, centerZ, radius, minX, maxX].every(Number.isFinite) && radius > 0 && maxX > minX
+    ? { centerY, centerZ, radius, minX, maxX } : null;
+}
+
+/**
+ * Draw rings and spokes on the actual wheel mesh, in that mesh's own units.
+ * Parenting carries its axle position, spin, authored rest rotation, suspension,
+ * gear retraction and model scale without reconstructing any of them from a
+ * second contact/aircraft definition. Measure and rebuild only when the rig/LOD
+ * changes; nothing is scanned per frame.
+ */
+export function createAircraftWheelDebugOverlay(scene: Scene,
+  getWheels: () => readonly AircraftWheelDebugSource[]) {
+  let enabled = false;
+  let disposed = false;
+  let boundNodes: TransformNode[] = [];
+  const drawings: { wheel: AbstractMesh; mesh: LinesMesh; material: Material | null }[] = [];
+
+  function clear(): void {
+    for (const drawing of drawings) {
+      drawing.mesh.dispose();
+      drawing.material?.dispose();
+    }
+    drawings.length = 0;
+    boundNodes = [];
+  }
+
+  function bind(wheels: readonly AircraftWheelDebugSource[]): void {
+    clear();
+    for (const { node } of wheels) {
+      boundNodes.push(node);
+      if (!(node instanceof AbstractMesh) || node.isDisposed()) continue;
+      const tire = measureTireOutline(node);
+      if (!tire) continue;
+      const { centerY, centerZ, radius } = tire;
+      const lines: Vector3[][] = [];
+      for (const x of [tire.minX, tire.maxX]) {
+        const ring = Array.from({ length: 33 }, (_, index) => new Vector3(x,
+          centerY + radius * Math.cos(index * Math.PI / 16),
+          centerZ + radius * Math.sin(index * Math.PI / 16)));
+        lines.push(ring, [new Vector3(x, centerY, centerZ), ring[0]]);
+      }
+      lines.push([new Vector3(tire.minX, centerY, centerZ), new Vector3(tire.maxX, centerY, centerZ)]);
+      const mesh = createTireOutline(scene, node, node.name, lines);
+      drawings.push({ wheel: node, mesh, material: mesh.material });
+    }
+  }
+
+  function update(): void {
+    if (!enabled || disposed) return;
+    const wheels = getWheels();
+    let changed = wheels.length !== boundNodes.length;
+    for (let index = 0; !changed && index < wheels.length; index++) changed = wheels[index].node !== boundNodes[index];
+    if (changed) bind(wheels);
+    for (const { wheel, mesh } of drawings) {
+      if (mesh.isDisposed()) continue;
+      // Babylon inherits parent enablement, but not a mesh's isVisible flag.
+      // Gear visibility uses that flag, so mirror it explicitly.
+      mesh.setEnabled(!wheel.isDisposed() && wheel.isEnabled() && wheel.isVisible && wheel.visibility > 0);
+    }
+  }
+
+  return {
+    setEnabled(value: boolean): void {
+      if (disposed || value === enabled) return;
+      enabled = value;
+      if (enabled) update();
+      else for (const { mesh } of drawings) if (!mesh.isDisposed()) mesh.setEnabled(false);
+    },
+    update,
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      enabled = false;
+      clear();
     },
   };
 }

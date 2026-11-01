@@ -1,7 +1,6 @@
 //! `createContactSupport` from `src/terrainContact.ts`: the ground under each
 //! contact unit and the one horizontal plane JSBSim is given for all of them,
-//! the arithmetic in the same order, with `createWheelGroundFilter` from
-//! `src/wheelGroundFilter.ts` per contact.
+//! using the same sampled surface heights and arithmetic in the same order.
 //!
 //! `measure(input)` is split where it samples the surface, which only the
 //! host can. Which spots it samples, and in what order, never depends on what
@@ -27,7 +26,7 @@
 //! - unit `[retractable, wheel]`, 0 or 1 each: a retractable BOGEY; a BOGEY
 //!   (`gear/unit`) rather than a STRUCTURE (`contact/unit`)
 //! - input: `SupportInput` `[lat, lon deg, altitude m, roll, pitch, heading
-//!   rad, cgGround m, revision, revisionChanged, cgDelta m, urgent, snap,
+//!   rad, cgGround m, revision, revisionChanged, cgDelta m, urgent, reserved,
 //!   samples, previousElevation m]`, flags 0 or 1, samples possibly infinite
 //! - values: `[gear/num-units, gear/gear-pos-norm, cg x, y, z in]`, then
 //!   `[x, y, z in]` per unit, the properties `readGeometry` reads
@@ -40,7 +39,7 @@
 //!   lowest contact depth m, in range, requests, samples applied]`
 
 use crate::geo::{body_offset_local, body_to_local_rotation, contact_body_position, metres_per_degree, wrap_lon};
-use crate::jsmath::{exp, hypot, max, min};
+use crate::jsmath::{hypot, max, min};
 
 pub const UNIT_STRIDE: usize = 2;
 pub const INPUT_LEN: usize = 14;
@@ -48,14 +47,12 @@ pub const VALUES_HEAD: usize = 5;
 pub const REQUEST_STRIDE: usize = 6;
 pub const OUTPUT_LEN: usize = 6;
 pub const MAX_CONTACTS: usize = 64;
-pub const GROUND_FILTER_LENGTH_METERS: f64 = 0.29;
 
 pub const GEOMETRY_READ: u32 = 0;
 pub const GEOMETRY_FAILED: u32 = 1;
 pub const GEOMETRY_UNAVAILABLE: u32 = 2;
 
 const GEAR_DOWN_POSITION: f64 = 0.99;
-const WHEELS_CLEAR_METERS: f64 = 5.0;
 const FOOTPRINT_RANGE_METERS: f64 = 10.0;
 const FOOTPRINT_REACH_METERS: f64 = 1.0;
 const FOOTPRINT_RESAMPLE_METERS: f64 = 0.05;
@@ -78,10 +75,10 @@ const REVISION: usize = 7;
 const REVISION_CHANGED: usize = 8;
 const CG_DELTA: usize = 9;
 const URGENT: usize = 10;
-const SNAP: usize = 11;
+const RESERVED_SNAP: usize = 11;
 const SAMPLES: usize = 12;
 const PREVIOUS_ELEVATION: usize = 13;
-pub const INPUT_FLAGS: [usize; 3] = [REVISION_CHANGED, URGENT, SNAP];
+pub const INPUT_FLAGS: [usize; 3] = [REVISION_CHANGED, URGENT, RESERVED_SNAP];
 
 // State: the closure's variables, then this step's between plan and finish.
 /// 1 while the contacts are discovered: `reader` exists and `count` is the unit count.
@@ -107,8 +104,8 @@ pub const SCALE_LON: usize = 15;
 pub const INPUT: usize = 16;
 pub const GLOBALS: usize = INPUT + INPUT_LEN;
 
-// Per contact: its filter, then `createContactSupport`'s arrays.
-pub const FILTER: usize = 0;
+// Per contact: offsets 0..2 are reserved for ABI compatibility, then
+// `createContactSupport`'s arrays. No filtered terrain is retained.
 pub const DOWN: usize = 2;
 pub const FOOT_LAT: usize = 3;
 pub const FOOT_LON: usize = 4;
@@ -135,27 +132,6 @@ pub const CONTACT_STRIDE: usize = 24;
 
 pub const fn state_len(contacts: usize) -> usize {
     GLOBALS + contacts * (CONTACT_STRIDE + 4)
-}
-
-/// `createWheelGroundFilter(length).height(raw, moved, snap)` on `[has, filtered]`.
-#[inline]
-pub fn filter_height(filter: &mut [f64], raw: f64, moved: f64, snap: bool, length: f64) -> f64 {
-    let max_bridged = length * 2.0;
-    if filter[0] == 0.0 || snap || !moved.is_finite() || (raw - filter[1]).abs() > max_bridged {
-        filter[0] = 1.0;
-        filter[1] = raw;
-        return raw;
-    }
-    filter[1] += (raw - filter[1]) * (1.0 - exp(-max(moved, 0.0) / length));
-    filter[1]
-}
-
-/// `shift(delta)`.
-#[inline]
-pub fn filter_shift(filter: &mut [f64], delta: f64) {
-    if filter[0] != 0.0 && delta.is_finite() {
-        filter[1] += delta;
-    }
 }
 
 /// The state split into the globals, the contacts and the plan.
@@ -185,7 +161,6 @@ fn clear_contacts(globals: &mut [f64], contacts: &mut [f64]) {
     globals[LIVE] = 0.0;
     globals[HAD_SUPPORT] = 0.0;
     for row in rows(contacts) {
-        row[FILTER] = 0.0;
         row[HELD_RAW] = f64::NAN;
         row[GROUND] = f64::NAN;
         for field in [PROVISIONAL, MARGIN, URGENT_FLAG, SUPPORTED, PREV_SUPPORTED, PREV_SAMPLED] {
@@ -243,7 +218,6 @@ fn read_geometry(units: &[f64], globals: &mut [f64], contacts: &mut [f64], input
         let retractable = units[i * UNIT_STRIDE] != 0.0;
         let on = !(retractable && !gear_down) && down.is_finite() && row[FOOT_LAT].is_finite() && row[FOOT_LON].is_finite();
         if !on && row[ACTIVE] != 0.0 {
-            row[FILTER] = 0.0;
             row[HELD_RAW] = f64::NAN;
             row[GROUND] = f64::NAN;
             row[PROVISIONAL] = 0.0;
@@ -367,7 +341,6 @@ pub fn plan(units: &[f64], state: &mut [f64], input: &[f64], values: &[f64], geo
             // Refinements are spatially coherent: the sample moves with the
             // change measured under the centre until measured at its own spot.
             if known_delta {
-                filter_shift(&mut row[FILTER..FILTER + 2], cg_delta);
                 row[GROUND] += cg_delta;
                 row[PROVISIONAL] += cg_delta;
             }
@@ -422,7 +395,6 @@ pub fn finish(units: &[f64], state: &mut [f64], requests: &[f64], output: &mut [
             row[URGENT_FLAG] = 0.0;
             if height.is_finite() {
                 let correction = height - row[HELD_RAW] - row[PROVISIONAL];
-                filter_shift(&mut row[FILTER..FILTER + 2], correction);
                 row[GROUND] += correction;
                 row[SHIFT] += correction;
                 row[HELD_RAW] = height;
@@ -436,10 +408,7 @@ pub fn finish(units: &[f64], state: &mut [f64], requests: &[f64], output: &mut [
         if !height.is_finite() {
             continue;
         }
-        let first = kind == SAMPLE_FIRST;
-        let snap = first || input[SNAP] != 0.0 || input[ALTITUDE] - row[DOWN] - height > WHEELS_CLEAR_METERS;
-        let moved = if first { 0.0 } else { row[MOVED] };
-        row[GROUND] = filter_height(&mut row[FILTER..FILTER + 2], height, moved, snap, GROUND_FILTER_LENGTH_METERS);
+        row[GROUND] = height;
         row[HELD_LAT] = row[FOOT_LAT];
         row[HELD_LON] = row[FOOT_LON];
         row[HELD_RAW] = height;

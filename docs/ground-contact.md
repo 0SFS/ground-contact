@@ -49,8 +49,42 @@ by that compression instead: 2.1 cm at the front and 1.8 cm at the back on the
 Air 2S, 1.2 and 0.7 cm on the Mini 2 (their `dji-*.xml`). Once settled, the
 drawn feet stand on the ground. The collision view (Debug → Collision geometry)
 draws each contact where the physics has it, with markers sized to the aircraft
-and a count of each kind, so a resting contact shows a little below its foot or
-wheel.
+and a count of each kind, so a resting foot or other structural contact shows a
+little below what is drawn. Wheel contacts add their native strut compression,
+so a resting wheel's dot sits at its tread.
+
+## What Collision geometry shows
+
+Amber dots show the loaded JSBSim model's wheel contact patches, including
+native suspension compression. They are not wheel centres. The bundled models
+use body-Z struts; an external aircraft with an oriented strut needs its
+compression axis exposed to draw that displacement correctly. Marker size is
+only a visibility aid. Cyan markers show body sweep probes, purple markers
+structural contacts, and white the centre of gravity.
+
+Amber wireframe wheels and spokes attach to the actual aircraft wheel meshes.
+Each outline is measured once, when the wheels are bound, from its mesh's own
+vertices: a circle around the tire and a ring at each tire face. Vertices
+nearer the axle than half the tire radius are hub and are left out. AF267's
+F-35B hubs and axle stubs reach well past one sidewall, so the mesh's bounding
+box would have put one ring beside the tire. A wheel without readable vertices
+gets no outline rather than a guessed one. Parenting shares the wheels' spin,
+gear movement, model scale and suspension transforms. They remain visible
+through the aircraft so rotation is easy to inspect. They are diagnostic lines,
+not an additional collision solver. The standalone C172 spin benchmark still
+has its original estimated outlines; the flight app uses the mesh-backed view
+for every aircraft instead of putting C172 coordinates on an F-35B.
+
+Point contacts are the current ground-force model on every device, not a low-end
+fallback. Wheel inertia maintains rotational state for presentation and feedback;
+it does not replace these contacts with volumetric tires. Collision geometry
+shows both because they answer different questions: where physics applies
+contact forces, and where/how the drawn wheel rotates.
+
+F-35B native bogey horizontal positions now follow the asset's extended axle and
+tread centres. Moving only a debug marker would have hidden the disagreement;
+the flight-model definitions themselves are corrected. Suspension presentation
+follows the native compressed contact height rather than a fixed drawn pose.
 
 ## The gear model, and what it does not include
 
@@ -101,24 +135,25 @@ contact in the native gear model.
 
 ## The ground a wheel rides on
 
-Because the surface is sampled at a point and resampled every physics step,
-photogrammetry noise of a few centimetres makes the whole ground plane twitch
-under a parked or taxiing aircraft, and the oleos never stop ringing.
+Terrain contact uses the heights returned from the displayed surface directly.
+There is no independently smoothed terrain surface or second collision mesh.
+The centre's sample and each contact's sample enter the support calculation
+without a height filter. Consequently, a rise, dip or changed surface while
+parked is not hidden behind an older filtered height.
 
-A real wheel does not follow that noise. It is a circle roughly 0.29 m in
-radius, so it bridges anything shorter than its contact patch and climbs only
-what it cannot bridge. `wheelGroundFilter.ts` reproduces that: the sampled
-height is filtered over **distance travelled**, with the wheel radius as the
-length constant.
+The existing query cache and contact sampling budgets still apply: matching
+coordinates share a query within a tick, and a held contact sample is refreshed
+according to travel and tile revision. Refinements are still measured at the
+same coordinate before they move the aircraft, and missing or implausible hits
+keep their existing guards. Removing height smoothing adds no rays, triangles
+or terrain detail.
 
-- Distance, not time. A parked aircraft must not drift, and a fast taxi must not
-  be over-smoothed.
-- Steps taller than the wheel pass straight through. Those are kerbs and cliffs;
-  smoothing one would drive the aircraft through it.
-- It adds no raycasts. It filters the sample already being taken.
-
-Raw samples still drive world-change detection. Only the question of where the
-aircraft sits uses the ridden height.
+Raw photogrammetry detail can excite the suspension more than a smoothed height.
+A short native C172/F-35B taxi fixture with centimetre-scale spatial noise stayed
+finite with raw samples, but this is not a guarantee for every tile or runway.
+The native solver still receives one horizontal support plane; exact mesh
+sampling alone does not supply an independent ground normal or force per wheel,
+and it does not correct an aircraft asset's suspension/contact alignment.
 
 ## When the map cannot answer
 

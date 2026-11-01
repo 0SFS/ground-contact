@@ -19,6 +19,10 @@ function createSdk(cg = { xIn: 42.117, yIn: -1.34, zIn: 37.739 }, completeCatalo
     values[`${prefix}x-position`] = contact.xIn;
     values[`${prefix}y-position`] = contact.yIn;
     values[`${prefix}z-position`] = contact.zIn;
+    if (contact.kind === "wheel") {
+      values[`${prefix}compression-ft`] = 0;
+      values[`${prefix}WOW`] = 0;
+    }
     if (completeCatalog || index > 0) catalog.push(`${prefix}x-position (RW)`, `${prefix}y-position (RW)`, `${prefix}z-position (RW)`);
   });
   return {
@@ -73,13 +77,73 @@ describe("collision debug overlay", () => {
 
     const reads = sdk.getPropertyValue.mock.calls.length;
     overlay.update();
-    // An unchanged CG reads the CG and nothing else.
-    expect(sdk.getPropertyValue).toHaveBeenCalledTimes(reads + 3);
+    // The scalar fallback reads CG plus compression/WOW, but no static
+    // contact geometry. The native backend refreshes these in one batch.
+    expect(sdk.getPropertyValue).toHaveBeenCalledTimes(reads + 9);
     overlay.setEnabled(false);
     overlay.update();
-    expect(sdk.getPropertyValue).toHaveBeenCalledTimes(reads + 3);
+    expect(sdk.getPropertyValue).toHaveBeenCalledTimes(reads + 9);
     overlay.dispose();
     expect(scene.meshes).toHaveLength(0);
+  });
+
+  it("moves wheel dots with native strut compression even when CG is unchanged", () => {
+    const scene = createScene();
+    const { sdk, values } = createSdk();
+    const overlay = createCollisionDebugOverlay(scene, new TransformNode("aircraft", scene), sdk as never, C172_BODY_COLLISION_PROBES);
+    overlay.setEnabled(true);
+    const wheel = scene.getMeshByName("collision-debug/wheel/gear/unit[1]")!;
+    const structure = scene.getMeshByName("collision-debug/structure/contact/unit[3]")!;
+    const wheelRest = wheel.position.clone(), structureRest = structure.position.clone();
+    const guides = scene.getMeshByName("collision-debug/guides")!;
+    const upload = vi.spyOn(guides, "updateVerticesData");
+    const readGeometry = () => sdk.getPropertyValue.mock.calls.filter(([path]) => /-position$/.test(path)).length;
+    const geometryReads = readGeometry();
+
+    overlay.update();
+    expect(upload).not.toHaveBeenCalled();
+    values["gear/unit[1]/WOW"] = 1;
+    values["gear/unit[1]/compression-ft"] = 0.2 / 0.3048;
+    values["contact/unit[3]/compression-ft"] = 10;
+    overlay.update();
+    expect(wheel.position.asArray()).toEqual([wheelRest.x, wheelRest.y + 0.2, wheelRest.z]);
+    expect(structure.position.equals(structureRest)).toBe(true);
+    expect(readGeometry()).toBe(geometryReads);
+    expect(upload).toHaveBeenCalledOnce();
+
+    overlay.update();
+    expect(upload).toHaveBeenCalledOnce();
+    // No accumulated offset on further compression or rebound.
+    values["gear/unit[1]/compression-ft"] = 0.1 / 0.3048;
+    overlay.update();
+    expect(wheel.position.y).toBeCloseTo(wheelRest.y + 0.1, 12);
+    values["gear/unit[1]/WOW"] = 0;
+    overlay.update();
+    expect(wheel.position.equals(wheelRest)).toBe(true);
+    overlay.dispose();
+  });
+
+  it("reuses and disposes one native batch for the live CG and compression properties", () => {
+    const scene = createScene();
+    const { sdk, values } = createSdk();
+    const dispose = vi.fn();
+    const read = vi.fn<(target: Float64Array) => void>();
+    const createPropertyBatch = vi.fn((paths: readonly string[]) => {
+      read.mockImplementation(target => { paths.forEach((path, index) => { target[index] = values[path]; }); });
+      return { missing: [], read, dispose };
+    });
+    const overlay = createCollisionDebugOverlay(scene, new TransformNode("aircraft", scene),
+      { ...sdk, createPropertyBatch } as never, []);
+    expect(createPropertyBatch).not.toHaveBeenCalled();
+    overlay.setEnabled(true);
+    expect(createPropertyBatch).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledOnce();
+    sdk.getPropertyValue.mockClear();
+    overlay.update();
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(sdk.getPropertyValue).not.toHaveBeenCalled();
+    overlay.dispose(); overlay.dispose();
+    expect(dispose).toHaveBeenCalledOnce();
   });
 
   it("follows the aircraft transform and uses the current JSBSim CG for probes and contacts", () => {

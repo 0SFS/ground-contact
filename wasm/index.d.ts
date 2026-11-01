@@ -4,7 +4,7 @@ export const SUPPORT: Readonly<{
   unitStride: 2; inputLength: 14; valuesHead: 5; requestStride: 6; outputLength: 6; globals: 30; contactStride: 24; maxContacts: 64;
   GEOMETRY_READ: 0; GEOMETRY_FAILED: 1; GEOMETRY_UNAVAILABLE: 2;
   state: Readonly<{ DISCOVERED: 0; LIVE: 1; HAD_SUPPORT: 2; REVALIDATE_IN: 6; STEPS: 7; REACH: 8; PHASE: 9; REQUESTS: 13 }>;
-  contact: Readonly<{ FILTER: 0; DOWN: 2; FOOT_LAT: 3; FOOT_LON: 4; HELD_RAW: 7; GROUND: 11; MARGIN: 12; ACTIVE: 19; SUPPORTED: 20 }>;
+  contact: Readonly<{ RESERVED: 0; DOWN: 2; FOOT_LAT: 3; FOOT_LON: 4; HELD_RAW: 7; GROUND: 11; MARGIN: 12; ACTIVE: 19; SUPPORTED: 20 }>;
 }>;
 export const WHEELS: Readonly<{ bodyLength: 16; wheelStride: 10; contactStride: 25; reportLength: 5; resultStride: 11; maxWheels: 16; maxContacts: 64 }>;
 export const SPIN: Readonly<{ wheelStride: 20; stateOffset: 0; configOffset: 9; inputOffset: 14; maxWheels: 16; INSTANT: 0; INERTIA: 1 }>;
@@ -55,7 +55,7 @@ export interface SurfaceSample { heightMeters: number; revision: number }
 export interface ContactSupport extends Kernel {
   readonly contactCount: number;
   readonly units: Float64Array;
-  /** [lat, lon, altitude, roll, pitch, heading, cgGround, revision, revisionChanged, cgDelta, urgent, snap, samples, previousElevation]. */
+  /** [lat, lon, altitude, roll, pitch, heading, cgGround, revision, revisionChanged, cgDelta, urgent, reserved, samples, previousElevation]. */
   readonly input: Float64Array;
   readonly values: Float64Array;
   readonly state: Float64Array;

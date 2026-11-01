@@ -11,8 +11,8 @@ export const SUPPORT = Object.freeze({
   GEOMETRY_READ: 0, GEOMETRY_FAILED: 1, GEOMETRY_UNAVAILABLE: 2,
   /** State offsets: globals, then per contact at globals + i * contactStride. */
   state: Object.freeze({ DISCOVERED: 0, LIVE: 1, HAD_SUPPORT: 2, REVALIDATE_IN: 6, STEPS: 7, REACH: 8, PHASE: 9, REQUESTS: 13 }),
-  /** FILTER is the ground filter's [has, height]. */
-  contact: Object.freeze({ FILTER: 0, DOWN: 2, FOOT_LAT: 3, FOOT_LON: 4, HELD_RAW: 7, GROUND: 11, MARGIN: 12, ACTIVE: 19, SUPPORTED: 20 }),
+  /** Offsets 0 and 1 are reserved legacy state; sampled terrain starts at DOWN. */
+  contact: Object.freeze({ RESERVED: 0, DOWN: 2, FOOT_LAT: 3, FOOT_LON: 4, HELD_RAW: 7, GROUND: 11, MARGIN: 12, ACTIVE: 19, SUPPORTED: 20 }),
 });
 export const WHEELS = Object.freeze({ bodyLength: 16, wheelStride: 10, contactStride: 25, reportLength: 5, resultStride: 11, maxWheels: 16, maxContacts: 64 });
 export const SPIN = Object.freeze({ wheelStride: 20, stateOffset: 0, configOffset: 9, inputOffset: 14, maxWheels: 16, INSTANT: 0, INERTIA: 1 });
@@ -198,7 +198,7 @@ export function createGroundContact(exports) {
             contactCount: n,
             /** Per unit [retractable, wheel]. */
             get units() { return view(unitRows); },
-            /** [lat, lon, altitude, roll, pitch, heading, cgGround, revision, revisionChanged, cgDelta, urgent, snap, samples, previousElevation]. */
+            /** [lat, lon, altitude, roll, pitch, heading, cgGround, revision, revisionChanged, cgDelta, urgent, reserved, samples, previousElevation]. */
             get input() { return view(input); },
             /** [gear/num-units, gear/gear-pos-norm, cg xyz in], then [x, y, z in] per unit. */
             get values() { return view(values); },

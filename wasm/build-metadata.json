@@ -37,18 +37,18 @@
     "crates/ground-contact/src/jsmath.rs": "1f55d20a75d81a10f345b2552055eeeed6ed58f902537957a3abf1b0d3e193c8",
     "crates/ground-contact/src/lib.rs": "5c9fede38be841cfc9b0589727d32150e542bb163dfb7e41a214724ff60e655d",
     "crates/ground-contact/src/spin.rs": "1630f80aab0d176e4c5fdcc60af17bcff4a3cf3350632638dc9c8e5282bb630e",
-    "crates/ground-contact/src/support.rs": "1475f1cd92da503bebaaba567ce3e82a9e49404444d0bd0ac61f7c2090e0c889",
+    "crates/ground-contact/src/support.rs": "feab21f3a28cba1d25acf20367bf7351e4c895c15ca79c0965bc4d12302a6a09",
     "crates/ground-contact/src/wheels.rs": "3bcac42c74271ebb6cfa2a9a58638608737652aa5cdc20cb69666801297e0348",
-    "index.d.ts": "ab895eaa252935e09287ad76b881d00331dd25929f031a679535cdeae7819ea8",
-    "index.js": "fe1799540b9bc4cc65faa8dd95e51c3b10067f85493d34e6273008d511636e6e",
+    "index.d.ts": "584f1525414b98c41d2898a8218b7afe1a23d441af1f117a8b5ea715056a5d63",
+    "index.js": "9a7cb2e7e6d69ead7b3169bc8afe03039d871a926fa5adcd01051d722ff348bf",
     "rust-toolchain.toml": "ef4d1f56bd8d2d2644df4c2c5786dc149046cd43048f4550420d77a8829f9e53",
     "scripts/build.mjs": "716db0bb19c1a724ffe9df1ac3b8945fb960fc93fbb8bf348f7d7a66666c511d",
-    "toolchain.lock.json": "9f932e04abff3dbc36646838c3573b9b65a2801b6a4672a5c654b0114e415406"
+    "toolchain.lock.json": "83e4e48d1b7bcb78435e38b8fcdd6c5d98e3a6bc10b53bdf960b36dc17e008b5"
   },
   "outputs": {
     "single/ground_contact.wasm": {
-      "sha256": "4acb1764647cd58d60a4d6b4023a93c5eff56f4cbd14cccd12bdb1cedface259",
-      "bytes": 74466
+      "sha256": "4ab23127aa38b0c7b4a824383d6b1ed1277c719366543331660f526e6f5c46a2",
+      "bytes": 74059
     }
   },
   "threaded": false,

@@ -6,7 +6,6 @@ import { GEAR_DOWN_POSITION, groundContactClearanceMeters, groundContactUnits, t
 import { createKernelSlot, type GroundContactCore, type GroundContactCoreSource, type GroundContactKernelStatus, type WasmContactSupport } from "./groundContactCore";
 import { createPropertyReadBatch } from "./propertyReadBatch";
 import { aircraftClearanceMeters, type AircraftClearanceStance, captureSimulation, PLACEMENT_TOLERANCE_METERS, restoreSimulation, WITHHELD_SUPPORT_DEPTH_METERS } from "./safeFlightState";
-import { createWheelGroundFilter, type WheelGroundFilter } from "./wheelGroundFilter";
 
 /**
  * A surface sample this far above a flying aircraft is not believed at all.
@@ -61,10 +60,6 @@ const SURFACE_REQUIRED_AGL_METERS = 500;
  * 120 Hz is a real gap; one frame is not.
  */
 const BLIND_STEPS = 60;
-
-/** Above this the wheels cannot be touching, so the surface is adopted raw and
- * touchdown is never met with a lagging ground height. */
-const WHEELS_CLEAR_METERS = 5;
 
 /**
  * The ground under each contact is sampled while the lowest contact is within
@@ -123,7 +118,7 @@ const SAMPLE_FIRST = 4, SAMPLE_URGENT = 3, SAMPLE_MOVED = 2, SAMPLE_LAZY = 1;
 interface SupportInput {
   lat: number; lon: number; altitude: number;
   roll: number; pitch: number; heading: number;
-  /** Filtered ground under the centre: the fallback, and the range reference. */
+  /** Sampled surface height under the centre: the fallback and range reference. */
   cgGround: number;
   revision: number;
   revisionChanged: boolean;
@@ -131,8 +126,6 @@ interface SupportInput {
   cgDelta: number;
   /** Confirm every contact sample the revision may have changed now, not lazily. */
   urgent: boolean;
-  /** Adopt raw heights outright, as the centre does. */
-  snap: boolean;
   /** Footprint samples allowed this step. */
   samples: number;
   /** The support plane from the previous step; NaN without one. */
@@ -177,7 +170,6 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
   let prevCgGround = 0, prevLowest = 0, prevLevel = 0;
   let revalidateIn = 0;
   let steps = 0;
-  let filters: WheelGroundFilter[] = [];
   // Per contact: the current footprint and its depth below the centre.
   let down = new Float64Array(0), footLat = new Float64Array(0), footLon = new Float64Array(0);
   // The last sample, where it was taken, the revision it was taken in, and
@@ -187,7 +179,7 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
   // Refinement measured under the centre and applied to a sample not yet
   // measured again at its own spot.
   let provisional = new Float64Array(0);
-  // Filtered ground, NaN without a sample; margin over the deciding contact.
+  // Sampled ground, NaN without a sample; margin over the deciding contact.
   let ground = new Float64Array(0), margin = new Float64Array(0), moved = new Float64Array(0);
   let shift = new Float64Array(0);
   // Why each contact wants a sample this step, and its order within that.
@@ -207,7 +199,6 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
     live = false;
     hadSupport = false;
     for (let i = 0; i < count; i++) {
-      filters[i].reset();
       heldRaw[i] = Number.NaN; ground[i] = Number.NaN;
       provisional[i] = 0; margin[i] = 0; urgent[i] = 0; supported[i] = 0; prevSupported[i] = 0; prevSampled[i] = 0;
     }
@@ -232,7 +223,6 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
     reader = createPropertyReadBatch(sdk, paths);
     values = new Float64Array(paths.length);
     count = units.length;
-    filters = Array.from({ length: count }, () => createWheelGroundFilter());
     const floats = () => new Float64Array(count), flags = () => new Uint8Array(count);
     down = floats(); footLat = floats(); footLon = floats();
     heldLat = floats(); heldLon = floats(); heldRaw = floats().fill(Number.NaN);
@@ -273,7 +263,6 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
       const on = !(units[i].retractable && !gearDown) && Number.isFinite(local.down)
         && Number.isFinite(footLat[i]) && Number.isFinite(footLon[i]);
       if (!on && active[i]) {
-        filters[i].reset();
         heldRaw[i] = Number.NaN; ground[i] = Number.NaN; provisional[i] = 0; urgent[i] = 0;
       }
       active[i] = on ? 1 : 0;
@@ -340,7 +329,6 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
         urgent[next] = 0;
         if (hit && Number.isFinite(hit.heightMeters)) {
           const correction = hit.heightMeters - heldRaw[next] - provisional[next];
-          filters[next].shift(correction);
           ground[next] += correction;
           shift[next] += correction;
           heldRaw[next] = hit.heightMeters; heldRevision[next] = hit.revision;
@@ -353,9 +341,7 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
       const hit = surface.sample(footLat[next], footLon[next]);
       // Keep the last sample over a hole; the move is retried next step.
       if (!hit || !Number.isFinite(hit.heightMeters)) continue;
-      const fresh = kind === SAMPLE_FIRST;
-      ground[next] = filters[next].height(hit.heightMeters, fresh ? 0 : moved[next],
-        fresh || input.snap || input.altitude - down[next] - hit.heightMeters > WHEELS_CLEAR_METERS);
+      ground[next] = hit.heightMeters;
       heldLat[next] = footLat[next]; heldLon[next] = footLon[next];
       heldRaw[next] = hit.heightMeters; heldRevision[next] = hit.revision; checked[next] = steps;
       provisional[next] = 0; urgent[next] = 0;
@@ -379,7 +365,6 @@ function createReferenceSupport(sdk: JSBSimSdk, surface: SurfaceQuery) {
           // Refinements are spatially coherent: the sample moves with the
           // change measured under the centre until measured at its own spot.
           if (knownDelta) {
-            filters[i].shift(input.cgDelta);
             ground[i] += input.cgDelta;
             provisional[i] += input.cgDelta;
           }
@@ -522,7 +507,7 @@ function createWasmSupport(sdk: JSBSimSdk, surface: SurfaceQuery, core: GroundCo
     row[0] = input.lat; row[1] = input.lon; row[2] = input.altitude;
     row[3] = input.roll; row[4] = input.pitch; row[5] = input.heading;
     row[6] = input.cgGround; row[7] = input.revision; row[8] = input.revisionChanged ? 1 : 0;
-    row[9] = input.cgDelta; row[10] = input.urgent ? 1 : 0; row[11] = input.snap ? 1 : 0;
+    row[9] = input.cgDelta; row[10] = input.urgent ? 1 : 0; row[11] = 0; // Reserved legacy smoothing flag.
     row[12] = input.samples; row[13] = input.previousElevation;
   }
 
@@ -684,11 +669,10 @@ export function createTerrainContact(
   // over a hill it could not see.
   let blindSteps = 0;
   let blockReason: TerrainBlockReason = null;
-  const wheelGround = createWheelGroundFilter();
   const contacts = createContactSupport(sdk, surface, options.core);
   const supportInput: SupportInput = {
     lat: 0, lon: 0, altitude: 0, roll: 0, pitch: 0, heading: 0, cgGround: 0, revision: 0,
-    revisionChanged: false, cgDelta: 0, urgent: false, snap: false, samples: 0, previousElevation: Number.NaN,
+    revisionChanged: false, cgDelta: 0, urgent: false, samples: 0, previousElevation: Number.NaN,
   };
   let proposal: TerrainRelocationProposal | null = null;
   let proposedContact: TerrainContactReference | null = null;
@@ -711,7 +695,6 @@ export function createTerrainContact(
 
   const clearContactHistory = (): void => {
     previous = null; placement = true; hasReference = false; rejectedSamples = 0; blindSteps = 0; blockReason = null;
-    wheelGround.reset();
     contacts.reset();
   };
   // A rejected/newly appearing floor must not launch JSBSim through its gear
@@ -1014,7 +997,7 @@ export function createTerrainContact(
       const roll = sdk.getPropertyValue("attitude/phi-deg") * Math.PI / 180;
       const pitch = sdk.getPropertyValue("attitude/theta-deg") * Math.PI / 180;
       const clearance = aircraftClearanceMeters(clearanceProfile, roll, pitch);
-      // Judged on the raw sample, before any filter adopts it.
+      // Judge the sampled surface before giving it to the contact solver.
       const penetration = hit.heightMeters + clearance - altitude;
       // Placement is exempt from both limits: spawning at a mountain airport
       // legitimately puts the aircraft far below a surface it has never seen.
@@ -1052,15 +1035,9 @@ export function createTerrainContact(
         const anchor = surface.sample(previous.lat, previous.lon);
         cgDelta = anchor && Number.isFinite(anchor.heightMeters) ? anchor.heightMeters - previous.height : Number.NaN;
       }
-      // A wheel rides its own footprint, not the point under the axle.
-      const movedMeters = previous ? Math.hypot((lat - previous.lat) * 111320,
-        (((lon - previous.lon + 540) % 360) - 180) * Math.cos(lat * Math.PI / 180) * 111320) : 0;
-      // A measured refinement moves the filtered ground with the surface, so the
-      // wheel keeps bridging the noise it was bridging instead of jolting.
-      if (revisionChanged && Number.isFinite(cgDelta)) wheelGround.shift(cgDelta);
-      const cgGround = wheelGround.height(hit.heightMeters, movedMeters,
-        placement || blindSteps > 0 || (revisionChanged && !Number.isFinite(cgDelta))
-        || altitude - hit.heightMeters > WHEELS_CLEAR_METERS);
+      // Use the same sampled surface height as the visible terrain. Contact
+      // samples below use the same rule; no second smoothed surface is kept.
+      const cgGround = hit.heightMeters;
       const fresh = placement || blindSteps > 0;
       supportInput.lat = lat; supportInput.lon = lon; supportInput.altitude = altitude;
       supportInput.roll = roll; supportInput.pitch = pitch;
@@ -1070,7 +1047,6 @@ export function createTerrainContact(
       supportInput.revisionChanged = revisionChanged;
       supportInput.cgDelta = cgDelta;
       supportInput.urgent = !googleTiles || fresh || !(Math.abs(cgDelta) <= 0.00001);
-      supportInput.snap = fresh;
       supportInput.samples = googleTiles && !fresh ? GOOGLE_FOOTPRINT_SAMPLES_PER_STEP : Number.POSITIVE_INFINITY;
       supportInput.previousElevation = previous ? previous.ground : Number.NaN;
       const measured = contacts.measure(supportInput);

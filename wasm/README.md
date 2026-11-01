@@ -9,7 +9,7 @@ host keeps everything that touches JSBSim or the surface:
 | --- | --- | --- |
 | `gc_hull_place` | the pose from the 22 properties, each hull probe's swept point in ECEF and its sweep this step | `visibleMeshCollision.ts` `place` |
 | `gc_hull_resolve` | the cast hits validated and ordered by step fraction; per hit a normal impulse with restitution and a Coulomb friction impulse; the CG moved clear; the state JSBSim is restored to | `visibleMeshCollision.ts` `sweep`, `resolve`, `update` |
-| `gc_support_reset`, `gc_support_plan`, `gc_support_finish` | `measure` split at its surface samples: the footprints and the samples to take, then the filtered ground per contact and the support plane | `terrainContact.ts` `createContactSupport`, `wheelGroundFilter.ts` |
+| `gc_support_reset`, `gc_support_plan`, `gc_support_finish` | `measure` split at its surface samples: the footprints and the samples to take, then the sampled ground per contact and the support plane | `terrainContact.ts` `createContactSupport` |
 | `gc_solve_wheels` | `solveCoupledRigidWheels` | `coupledRigidWheels.ts`, `wheelContact.ts` |
 | `gc_step_wheel_spin` | `stepWheelSpin` | `wheelSpin.ts` |
 | `gc_sin`, `gc_cos`, `gc_atan2` | the core's libm trig | for checks that need the core's exact results |
@@ -87,11 +87,12 @@ side effects the rest of the step depends on.
 `{ retractable, prefix }` from `groundContactUnits` or
 `{ retractable, wheel }`. A unit is a wheel when its prefix is `gear/`
 (a BOGEY) rather than `contact/` (a STRUCTURE). The kernel keeps every
-contact's state between steps, including its ground filter. Per step, as
+contact's sampled surface height between steps. The first two contact-state slots
+are reserved for ABI compatibility; no smoothed terrain copy is retained. Per step, as
 `createContactSupport`'s `measure`:
 
 1. Fill `input`: lat, lon (deg), altitude (m), roll, pitch, heading (rad),
-   cgGround (m), revision, revisionChanged, cgDelta (m), urgent, snap,
+   cgGround (m), revision, revisionChanged, cgDelta (m), urgent, reserved (0),
    samples, previousElevation (m).
 2. If `wantsGeometry()`, read `[gear/num-units, gear/gear-pos-norm,
    cg x, y, z in]` and each unit's `x, y, z-position` into `values`.

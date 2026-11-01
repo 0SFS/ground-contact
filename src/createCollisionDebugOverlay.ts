@@ -5,6 +5,7 @@ import {
 } from "@babylonjs/core";
 import { groundContactBodyPosition, type BodyCollisionProbe } from "./collisionGeometry";
 import { groundContactUnits, type GroundContactUnit } from "./groundContactClearance";
+import { createPropertyReadBatch } from "./propertyReadBatch";
 
 type MarkerKind = "body" | "wheel" | "structure" | "cg";
 const COLORS: Record<MarkerKind, string> = {
@@ -25,6 +26,9 @@ export function collisionMarkerDiameter(reachM: number): number {
 
 /** Shows the actual point contacts, not an invented solid collision hull:
  * the points the hull probes sweep, and the loaded model's JSBSim contacts.
+ * Wheel dots follow the compression-adjusted tire contact patches. The bundled
+ * aircraft use body-Z struts, so native compression moves a bogey upward in this
+ * frame; oriented external struts need their compression axis exposed first.
  * Local coordinates are aircraft left/up/forward in metres, centred on its CG.
  * Marker sizes and spokes are visibility aids, not physical collision geometry.
  */
@@ -41,6 +45,11 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
   let legend: CollisionDebugLegend | null = null;
   // Each contact's x, y and z position properties, three per contact.
   let contactPaths: string[] = [];
+  let liveReader: ReturnType<typeof createPropertyReadBatch> | null = null;
+  let compressionSlots = new Int32Array(0);
+  let lastCompression = new Float64Array(0);
+  let contactBase = new Float64Array(0);
+  let contactKnown = new Uint8Array(0);
   let guidePositions = new Float32Array(0);
   const lastCg = { xIn: NaN, yIn: NaN, zIn: NaN };
   const contact = { xIn: 0, yIn: 0, zIn: 0 };
@@ -51,6 +60,21 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
     let contacts: readonly GroundContactUnit[] = [];
     try { contacts = groundContactUnits(sdk); } catch { /* None to show. */ }
     contactPaths = contacts.flatMap(({ prefix }) => ["x", "y", "z"].map(axis => `${prefix}${axis}-position`));
+    const livePaths = ["inertia/cg-x-in", "inertia/cg-y-in", "inertia/cg-z-in"];
+    compressionSlots = new Int32Array(contacts.length).fill(-1);
+    lastCompression = new Float64Array(contacts.length).fill(Number.NaN);
+    contactBase = new Float64Array(contacts.length * 3);
+    contactKnown = new Uint8Array(contacts.length);
+    for (let index = 0; index < contacts.length; index++) {
+      const { prefix } = contacts[index];
+      if (!prefix.startsWith("gear/")) continue;
+      compressionSlots[index] = livePaths.length;
+      livePaths.push(`${prefix}compression-ft`, `${prefix}WOW`);
+    }
+    // One native batch refreshes CG and wheel compression while this debug
+    // view is visible. Static contact positions and body probes update only
+    // when CG changes; no buffer uploads occur on an unchanged pose.
+    liveReader = createPropertyReadBatch(sdk, livePaths);
     root = new TransformNode("collision-debug", scene);
     root.parent = parent;
     root.doNotSerialize = true;
@@ -140,28 +164,45 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
 
   function update(): void {
     if (!enabled || disposed || !guides) return;
-    const xIn = sdk.getPropertyValue("inertia/cg-x-in");
-    const yIn = sdk.getPropertyValue("inertia/cg-y-in");
-    const zIn = sdk.getPropertyValue("inertia/cg-z-in");
+    const live = liveReader!.read();
+    const xIn = live[0], yIn = live[1], zIn = live[2];
     const valid = Number.isFinite(xIn) && Number.isFinite(yIn) && Number.isFinite(zIn);
-    if (valid && xIn === lastCg.xIn && yIn === lastCg.yIn && zIn === lastCg.zIn) return;
-    lastCg.xIn = xIn; lastCg.yIn = yIn; lastCg.zIn = zIn;
-    // Hide what the CG cannot place and collapse its guide, instead of
-    // showing NaNs or a plausible-looking position based on a guessed CG.
-    for (let index = 0; index < bodyMarkers.length; index++) {
-      const probe = probes[index];
-      groundContactBodyPosition(probe, lastCg, offset);
-      // The point the probe sweeps sits its inset above the hull point.
-      place(bodyMarkers[index], valid, offset.left, offset.up + probe.insetIn * 0.0254, offset.forward, index);
+    const cgChanged = !valid || xIn !== lastCg.xIn || yIn !== lastCg.yIn || zIn !== lastCg.zIn;
+    let changed = cgChanged;
+    if (cgChanged) {
+      lastCg.xIn = xIn; lastCg.yIn = yIn; lastCg.zIn = zIn;
+      // Hide what the CG cannot place and collapse its guide, instead of
+      // showing NaNs or a plausible-looking position based on a guessed CG.
+      for (let index = 0; index < bodyMarkers.length; index++) {
+        const probe = probes[index];
+        groundContactBodyPosition(probe, lastCg, offset);
+        place(bodyMarkers[index], valid, offset.left, offset.up + probe.insetIn * 0.0254, offset.forward, index);
+      }
+      for (let index = 0; index < groundMarkers.length; index++) {
+        contact.xIn = sdk.getPropertyValue(contactPaths[index * 3]);
+        contact.yIn = sdk.getPropertyValue(contactPaths[index * 3 + 1]);
+        contact.zIn = sdk.getPropertyValue(contactPaths[index * 3 + 2]);
+        groundContactBodyPosition(contact, lastCg, offset);
+        contactKnown[index] = valid && Number.isFinite(contact.xIn) && Number.isFinite(contact.yIn) && Number.isFinite(contact.zIn) ? 1 : 0;
+        contactBase[index * 3] = offset.left;
+        contactBase[index * 3 + 1] = offset.up;
+        contactBase[index * 3 + 2] = offset.forward;
+      }
     }
     for (let index = 0; index < groundMarkers.length; index++) {
-      contact.xIn = sdk.getPropertyValue(contactPaths[index * 3]);
-      contact.yIn = sdk.getPropertyValue(contactPaths[index * 3 + 1]);
-      contact.zIn = sdk.getPropertyValue(contactPaths[index * 3 + 2]);
-      groundContactBodyPosition(contact, lastCg, offset);
-      const known = valid && Number.isFinite(contact.xIn) && Number.isFinite(contact.yIn) && Number.isFinite(contact.zIn);
-      place(groundMarkers[index], known, offset.left, offset.up, offset.forward, bodyMarkers.length + index);
+      const slot = compressionSlots[index];
+      // The native strut displacement is mTGear * (0, 0, -compression-ft)
+      // in body axes. Bundled bogeys have the identity mTGear. WOW gates the
+      // value because retracting a unit can leave its last compression stored.
+      const feet = slot >= 0 && live[slot + 1] > 0.5 ? live[slot] : 0;
+      const compression = Number.isFinite(feet) ? Math.max(0, feet) * 0.3048 : 0;
+      if (!cgChanged && compression === lastCompression[index]) continue;
+      lastCompression[index] = compression;
+      changed = true;
+      place(groundMarkers[index], contactKnown[index] !== 0, contactBase[index * 3],
+        contactBase[index * 3 + 1] + compression, contactBase[index * 3 + 2], bodyMarkers.length + index);
     }
+    if (!changed) return;
     let reachM = 0;
     for (const mesh of bodyMarkers) if (mesh.isVisible) reachM = Math.max(reachM, mesh.position.length());
     for (const mesh of groundMarkers) if (mesh.isVisible) reachM = Math.max(reachM, mesh.position.length());
@@ -187,6 +228,8 @@ export function createCollisionDebugOverlay(scene: Scene, parent: TransformNode,
       disposed = true;
       enabled = false;
       root?.dispose();
+      liveReader?.dispose();
+      liveReader = null;
       for (const material of materials) material.dispose();
       root = null;
       guides = null;

@@ -205,7 +205,7 @@ export function groundChoiceUnavailable<K extends GroundLockableKey>(
       if (value === "roughness") return "Requires footprint contact";
       return context.rotation === "off" ? "Requires a wheel response (Instant or Finite inertia)" : null;
     case "wheelVisuals":
-      return value === "off" ? null : "Asset wheel rotation is not implemented; Debug outlines remain available";
+      return value === "off" ? null : "This ground-model override for asset wheel rotation is not implemented";
   }
   return null;
 }

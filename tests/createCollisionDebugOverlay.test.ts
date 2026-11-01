@@ -123,6 +123,122 @@ describe("collision debug overlay", () => {
     overlay.dispose();
   });
 
+  it("rides a retractable wheel's dot with its tire while the gear moves and hides it once stowed", () => {
+    const scene = createScene();
+    const { sdk, values } = createSdk();
+    // The main wheels retract; the nose wheel stays fixed.
+    const catalog = sdk.queryPropertyCatalog() + "\ngear/unit[1]/pos-norm (RW)\ngear/unit[2]/pos-norm (RW)";
+    sdk.queryPropertyCatalog.mockReturnValue(catalog);
+    values["gear/gear-pos-norm"] = 1;
+    const aircraft = new TransformNode("aircraft", scene);
+    aircraft.position.set(10, 20, 30);
+    aircraft.rotationQuaternion = Quaternion.RotationAxis(Vector3.Up(), 0.4);
+    // Unit 1's leg hinges on the aircraft; unit 2 has no wheel loaded.
+    const leg = new TransformNode("leftSuspension", scene);
+    leg.parent = aircraft;
+    leg.position.set(1.2, -0.4, -0.6);
+    let loaded = false;
+    const carrier = vi.fn((unit: number) => loaded && unit === 1 ? leg : null);
+    const overlay = createCollisionDebugOverlay(scene, aircraft, sdk as never, [], { carrier });
+    overlay.setEnabled(true);
+    const nose = scene.getMeshByName("collision-debug/wheel/gear/unit")!;
+    const left = scene.getMeshByName("collision-debug/wheel/gear/unit[1]")!;
+    const right = scene.getMeshByName("collision-debug/wheel/gear/unit[2]")!;
+    const noseRest = nose.position.clone(), leftRest = left.position.clone(), rightRest = right.position.clone();
+    expect(carrier).toHaveBeenCalledWith(1);
+    expect(carrier).not.toHaveBeenCalledWith(0);
+    // The rig loads after the dot is placed, with the gear down.
+    loaded = true;
+    overlay.update();
+
+    // Mid-transit, after this frame's rig pose but before Babylon rendered it.
+    leg.computeWorldMatrix(true);
+    const swing = (angle: number) => {
+      leg.rotationQuaternion = Quaternion.RotationAxis(Vector3.Left(), angle);
+      return leftRest.subtract(leg.position).applyRotationQuaternion(leg.rotationQuaternion).addInPlace(leg.position);
+    };
+    values["gear/gear-pos-norm"] = 0.6;
+    let expected = swing(0.7);
+    overlay.update();
+    expect(left.isVisible).toBe(true);
+    for (const axis of [0, 1, 2]) expect(left.position.asArray()[axis]).toBeCloseTo(expected.asArray()[axis], 5);
+    expect(left.position.subtract(leftRest).length()).toBeGreaterThan(0.1);
+    // A unit without a wheel keeps its extended contact; the fixed wheel never moves.
+    expect(right.isVisible).toBe(true);
+    expect(right.position.equals(rightRest)).toBe(true);
+    expect(nose.position.equals(noseRest)).toBe(true);
+
+    // Stowed, the retractable dots go; the fixed wheel's stays.
+    values["gear/gear-pos-norm"] = 0;
+    swing(1.5);
+    overlay.update();
+    expect([left.isVisible, right.isVisible, nose.isVisible]).toEqual([false, false, true]);
+    values["gear/gear-pos-norm"] = 0.3;
+    expected = swing(1.2);
+    overlay.update();
+    expect(left.isVisible).toBe(true);
+    for (const axis of [0, 1, 2]) expect(left.position.asArray()[axis]).toBeCloseTo(expected.asArray()[axis], 5);
+
+    // Down and locked again, it is the compressed contact once more.
+    values["gear/gear-pos-norm"] = 1;
+    values["gear/unit[1]/WOW"] = 1;
+    values["gear/unit[1]/compression-ft"] = 0.15 / 0.3048;
+    leg.rotationQuaternion = Quaternion.Identity();
+    overlay.update();
+    expect(left.position.x).toBe(leftRest.x);
+    expect(left.position.y).toBeCloseTo(leftRest.y + 0.15, 12);
+    expect(left.position.z).toBe(leftRest.z);
+    overlay.dispose();
+  });
+
+  it("rides from the first extension when the rig can pose the gear down, and leaves its pose as it was", () => {
+    const scene = createScene();
+    const { sdk, values } = createSdk();
+    const catalog = sdk.queryPropertyCatalog() + "\ngear/unit[1]/pos-norm (RW)";
+    sdk.queryPropertyCatalog.mockReturnValue(catalog);
+    const aircraft = new TransformNode("aircraft", scene);
+    aircraft.rotationQuaternion = Quaternion.RotationAxis(Vector3.Up(), -0.3);
+    const leg = new TransformNode("leftSuspension", scene);
+    leg.parent = aircraft;
+    leg.position.set(1.2, -0.4, -0.6);
+    const swing = (angle: number) => { leg.rotationQuaternion = Quaternion.RotationAxis(Vector3.Left(), angle); };
+    // The view opens with the gear stowed; the rig poses it down only on request.
+    values["gear/gear-pos-norm"] = 0;
+    swing(1.5);
+    let stowedAngle = 1.5;
+    const withGearDown = vi.fn((read: () => void) => {
+      swing(0);
+      try { read(); } finally { swing(stowedAngle); }
+    });
+    const overlay = createCollisionDebugOverlay(scene, aircraft, sdk as never, [], { carrier: unit => unit === 1 ? leg : null, withGearDown });
+    overlay.setEnabled(true);
+    const left = scene.getMeshByName("collision-debug/wheel/gear/unit[1]")!;
+    expect(left.isVisible).toBe(false);
+    expect(withGearDown).toHaveBeenCalledOnce();
+    // The stowed pose is back, and so is its world matrix.
+    const stowed = leg.getWorldMatrix().clone();
+    leg.computeWorldMatrix(true);
+    expect(stowed.asArray()).toEqual(leg.getWorldMatrix().asArray());
+
+    // The first extension: the dot is on the tire from the start.
+    values["gear/gear-pos-norm"] = 0.2;
+    stowedAngle = 1.2;
+    swing(stowedAngle);
+    overlay.update();
+    expect(left.isVisible).toBe(true);
+    const riding = left.position.clone();
+    const turn = leg.rotationQuaternion!.clone();
+    // Down and locked, it is at the contact, and the tire got there with it.
+    values["gear/gear-pos-norm"] = 1;
+    swing(0);
+    overlay.update();
+    const expected = left.position.subtract(leg.position).applyRotationQuaternion(turn).addInPlace(leg.position);
+    for (const axis of [0, 1, 2]) expect(riding.asArray()[axis]).toBeCloseTo(expected.asArray()[axis], 5);
+    expect(riding.subtract(left.position).length()).toBeGreaterThan(0.1);
+    expect(withGearDown).toHaveBeenCalledOnce();
+    overlay.dispose();
+  });
+
   it("reuses and disposes one native batch for the live CG and compression properties", () => {
     const scene = createScene();
     const { sdk, values } = createSdk();

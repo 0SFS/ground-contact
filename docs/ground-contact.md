@@ -56,7 +56,15 @@ so a resting wheel's dot sits at its tread.
 ## What Collision geometry shows
 
 Amber dots show the loaded JSBSim model's wheel contact patches, including
-native suspension compression. They are not wheel centres. The bundled models
+native suspension compression. They are not wheel centres. JSBSim applies a
+retractable wheel only while its gear is down and locked. While the gear moves,
+its dot keeps the point on the tire it had on the down stop and rides with the
+node that carries the wheel, its suspension leg in the flight app; once the
+gear is stowed, the dot is hidden. The app's rig can pose the gear down for a
+moment, struts unloaded, so a dot finds that point even when the view opens
+with the gear up; without that, it rides once the gear has been seen locked
+down. Without a carrier, the dot stays at its extended contact until the gear
+is stowed. The bundled models
 use body-Z struts; an external aircraft with an oriented strut needs its
 compression axis exposed to draw that displacement correctly. Marker size is
 only a visibility aid. Cyan markers show body sweep probes, purple markers

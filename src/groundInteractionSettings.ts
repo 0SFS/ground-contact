@@ -79,9 +79,9 @@ export const GROUND_CHOICE_LABELS: { [K in GroundLockableKey]: Record<GroundInte
   wheelVisuals: { off: "Off", asset: "Asset wheel rotation" },
 };
 
-/** The least work: JSBSim's own ground forces and nothing added (the Ground: Minimal preset). */
+/** Finite wheel inertia by default; aircraft ground forces remain with JSBSim. */
 export const DEFAULT_GROUND_INTERACTION_SETTINGS: Readonly<GroundInteractionSettingsV1> = Object.freeze({
-  version: 1, selection: "manual", rotation: "off", forceModel: "jsbsim", contactModel: "shared", backend: "auto",
+  version: 1, selection: "manual", rotation: "inertia", forceModel: "jsbsim", contactModel: "shared", backend: "auto",
   tireAudio: "off", haptics: "off", wheelVisuals: "off", tireAudioVolume: 0.7, hapticStrength: 0.6, locked: {},
 });
 
@@ -99,7 +99,7 @@ export type GroundSettingsParse =
 
 /**
  * Validates or migrates one settings object. Unversioned (pre-V1) objects and
- * missing/invalid fields fall back to Minimal's safe values. A newer version is
+ * missing/invalid fields fall back to the current defaults. A newer version is
  * rejected, never downgraded.
  */
 export function parseGroundInteractionSettings(value: unknown): GroundSettingsParse {

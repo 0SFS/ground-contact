@@ -22,11 +22,11 @@ const ROUGH_TERRAIN = {
 const base = (): GroundInteractionSettingsV1 => ({ ...DEFAULT_GROUND_INTERACTION_SETTINGS, locked: {} });
 
 describe("settings migration", () => {
-  it("defaults to the least work: manual, no wheel feedback, JSBSim/shared terrain on CPU", () => {
+  it("defaults to finite wheel inertia with JSBSim/shared terrain on CPU", () => {
     const store = createGroundSettingsStore(groundContactParameterDefaults());
-    expect(store.settings).toMatchObject({ version: 1, selection: "manual", rotation: "off",
+    expect(store.settings).toMatchObject({ version: 1, selection: "manual", rotation: "inertia",
       forceModel: "jsbsim", contactModel: "shared", backend: "auto", tireAudio: "off", haptics: "off", wheelVisuals: "off" });
-    expect(resolveGroundInteraction(store.settings, CAPABILITIES).active.backend).toBe("cpu-js");
+    expect(resolveGroundInteraction(store.settings, CAPABILITIES).active).toMatchObject({ rotation: "inertia", backend: "cpu-js" });
   });
 
   it("migrates an unversioned, partial record field by field to safe values", () => {
@@ -100,7 +100,7 @@ describe("requested → active → reason", () => {
 
   it("reports boundary choices as pending until applied, while immediate choices change now", () => {
     const requested = patchGroundSettings(base(), LANDING_FEEDBACK);
-    const resolution = resolveGroundInteraction(requested, CAPABILITIES, base());
+    const resolution = resolveGroundInteraction(requested, CAPABILITIES, { ...base(), rotation: "off" });
     expect(resolution.entries.rotation).toMatchObject({ requested: "inertia", active: "off", pending: true });
     expect(resolution.entries.tireAudio).toMatchObject({ active: "off", reason: "Requires Finite inertia wheel response" });
     expect(resolveGroundInteraction(requested, CAPABILITIES, requested).active.tireAudio).toBe("slip");

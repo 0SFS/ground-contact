@@ -2,6 +2,10 @@
 
 Landing gear, wheels, and collision with the streamed terrain.
 
+Finite wheel inertia is enabled by default. Aircraft forces remain with JSBSim;
+tire audio and haptics remain opt-in. Saved explicit wheel-response choices are
+preserved, and the Ground: Minimal preset still disables wheel feedback.
+
 The fly app depends on this package and runs its tests. From the `fly` directory, `npm test` includes them.
 
 ## Community

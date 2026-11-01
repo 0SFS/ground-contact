@@ -97,7 +97,9 @@ function groundChoice<Key extends GroundLockableKey>(key: Key, description: stri
     kind: "choice" as const,
     choices: (GROUND_CHOICES[key] as readonly string[]).map(id => ({ id, label: labels[id] })),
     default: DEFAULT_GROUND_INTERACTION_SETTINGS[key] as string,
-    defaultReason: "The Minimal profile: the ground as JSBSim models it, with nothing added.",
+    defaultReason: key === "rotation"
+      ? "Retain wheel angular velocity through liftoff and model gradual spin-up."
+      : "Keep JSBSim ground forces and shared terrain; additional feedback stays opt-in.",
     home: all(GROUND),
     appliesLive: true,
     source: "ground-contact/src/groundInteractionSettings.ts",

@@ -30,6 +30,14 @@
       "source": "./src/ecefBridge.ts",
       "default": "./src/ecefBridge.ts"
     },
+    "./enuFrame": {
+      "source": "./src/enuFrame.ts",
+      "default": "./src/enuFrame.ts"
+    },
+    "./floatingOrigin": {
+      "source": "./src/floatingOrigin.ts",
+      "default": "./src/floatingOrigin.ts"
+    },
     "./flightState": {
       "source": "./src/flightState.ts",
       "default": "./src/flightState.ts"
